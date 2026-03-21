@@ -80,6 +80,8 @@ class AxiomTensor:
             elif hasattr(t, 'axes'):
                 # Otherwise, it's a standard PackedAxis, so look at its children
                 explicit_names.update([getattr(a, 'source_name', a.name) for a in t.axes])
+                # Also register the unified parent name! (e.g., 'h&dh')
+                explicit_names.add(t.name)
             else:
                 explicit_names.add(getattr(t, 'source_name', t.name))
 
@@ -333,9 +335,12 @@ class AxiomTensor:
 
         for ax_def, token in zip(self.axes, lhs_resolved):
             if isinstance(token, PackedAxis):
-                if token.name != ax_def.name:
+                # THE FIX: Check source_name first! If it's an alias, this will match ax_def.
+                token_name = getattr(token, 'source_name', token.name)
+
+                if token_name != ax_def.name:
                     raise AxiomShapeError(
-                        f"Expected packed axis '{ax_def.name}', got '{token.name}'. Use '->' to route.")
+                        f"Expected packed axis '{ax_def.name}', got '{token_name}'. Use '->' to route.")
 
                 # Dynamic Unpack Check
                 unknown_count = sum(1 for a in token.axes if a.size is None)
