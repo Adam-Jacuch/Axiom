@@ -19,6 +19,46 @@ class AxiomTensor:
         new_axes = tuple(new_axis if a.name == old_axis.name else a for a in self.axes)
         return AxiomTensor(self.data, new_axes)
 
+    def embed(self, vocab: int, out: Axis, dtype=None, return_weight=False):
+        """Efficient integer embedding that spawns a new physical dimension."""
+        from flax import nnx
+        import jax.numpy as jnp
+        from .module import context
+
+        active_mod = context.get_active()
+        if active_mod is None:
+            raise RuntimeError(".embed() must be called inside an axiom.Module.")
+
+        embed_dim = out.size
+        if embed_dim is None:
+            raise ValueError(f"Embedding requires an explicit dimension size, e.g., ax.d(128)")
+
+        param_name = f"_axiom_embed_{active_mod._axiom_param_counter}"
+        active_mod._axiom_param_counter += 1
+
+        if not getattr(active_mod, '_axiom_initialized', False):
+            e_dtype = dtype if dtype is not None else jnp.float32
+            setattr(active_mod, param_name, nnx.Embed(
+                num_embeddings=vocab,
+                features=embed_dim,
+                dtype=e_dtype,
+                param_dtype=e_dtype,
+                rngs=nnx.Rngs(0)
+            ))
+
+        embed_layer = getattr(active_mod, param_name)
+        new_data = embed_layer(self.data)
+        out_tensor = AxiomTensor(new_data, (*self.axes, out))
+
+        # THE FIX: Return the embedding matrix as an AxiomTensor for Einsum routing!
+        if return_weight:
+            w_data = embed_layer.embedding.get_value()
+            from .axis import Axis  # Ensure Axis is in scope
+            w_tensor = AxiomTensor(w_data, (Axis('vocab', vocab), out))
+            return out_tensor, w_tensor
+
+        return out_tensor
+
     def __add__(self, other):
         if isinstance(other, AxiomTensor):
             self_names = [a.name for a in self.axes]

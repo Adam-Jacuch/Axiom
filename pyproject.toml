@@ -1,12 +1,23 @@
 [project]
 name = "axiom"
-version = "0.1.0"
-description = "A high perfomance ML tensor manipulation library"
-requires-python = ">=3.13"
+version = "1.1.0"
+description = "Shape-Safe Deep Learning Compiler"
+readme = "README.md"
+requires-python = ">=3.10" # Lowered for maximum compatibility!
+
+# CORE DEPENDENCIES: Notice we only ask for pure 'jax'
 dependencies = [
-    "flax>=0.12.5",
-    "jax>=0.9.2",
+    "jax",
+    "flax",
+    "optax"
 ]
+
+# OPTIONAL HARDWARE DEPENDENCIES
+[project.optional-dependencies]
+cpu = ["jax[cpu]"]
+cuda = ["jax[cuda12]"]     # Standard NVIDIA CUDA 12
+cuda13 = ["jax[cuda13]"]   # Bleeding-edge NVIDIA CUDA 13
+amd = ["jax[rocm]"]        # AMD GPU / ROCm support
 
 [build-system]
 requires = ["hatchling"]

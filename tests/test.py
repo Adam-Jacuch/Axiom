@@ -7,6 +7,7 @@ This script demonstrates the core capabilities of the Axiom eDSL, including:
 3. Implicit Memory Allocation (.proj, .norm_rms)
 4. Mixed Precision Training (bfloat16 & .cast)
 5. XLA-Compiled Training Loops
+6. Rank-Altering Embeddings & Tied Weights
 """
 
 import jax
@@ -72,10 +73,11 @@ class FeedForward(Module):
 
 
 # =============================================================================
-# 3. Model Architecture (Showcasing Pre-Norm & Residual Stability)
+# 3. Model Architecture (Showcasing Tied Weights & Embeddings)
 # =============================================================================
 class AxiomLM(Module):
     def __init__(self, vocab_size: int, dim: int, heads: int, depth: int):
+        self.vocab_size = vocab_size
         self.dim = dim
         self.layers = nnx.List([
             nnx.List([Attention(dim, heads), FeedForward(dim)])
@@ -83,20 +85,18 @@ class AxiomLM(Module):
         ])
 
     def __call__(self, x):
-        # Dynamically capture vocab size to reuse on the way out
-        vocab = x.data.shape[-1]
+        # 1. Efficient Integer Embedding & Weight Tying Extraction
+        # Transforms [b, sq] -> [b, sq, d]
+        x, w_emb = x.embed(vocab=self.vocab_size, out=ax.d(self.dim), return_weight=True)
 
-        # Input Embedding Projection
-        x = x[..., ax.vocab.proj(out=ax.d(self.dim), use_bias=False)]
-
-        # Transformer Blocks (Pre-Norm architecture)
+        # 2. Transformer Blocks (Pre-Norm architecture)
         for attn, ff in self.layers:
             x = x + attn(x[..., ax.d.norm_rms()])
             x = x + ff(x[..., ax.d.norm_rms()])
 
-        # Final Norm and Readout Projection
+        # 3. Final Norm and Tied-Weight Readout Projection
         x = x[..., ax.d.norm_rms()]
-        return x[..., ax.d.proj(out=ax.vocab(vocab), use_bias=False)]
+        return x[..., ax.d.proj(out=ax.vocab(self.vocab_size), weight=w_emb)]
 
 
 # =============================================================================
@@ -112,13 +112,13 @@ def main():
     # 1. Initialize Model
     model = AxiomLM(vocab_size=VOCAB, dim=DIM, heads=HEADS, depth=DEPTH)
 
-    # 2. Generate Dummy Sequence Data
+    # 2. Generate Dummy Integer Sequence Data (Massive memory savings!)
     key_x, key_y = jax.random.split(jax.random.key(42))
-    X_raw = jax.nn.one_hot(jax.random.randint(key_x, (BATCH, SEQ), 0, VOCAB), VOCAB)
-    y_raw = jax.nn.one_hot(jax.random.randint(key_y, (BATCH, SEQ), 0, VOCAB), VOCAB)
+    x_ints = jax.random.randint(key_x, (BATCH, SEQ), 0, VOCAB)
+    y_labels = jax.random.randint(key_y, (BATCH, SEQ), 0, VOCAB)
 
-    # 3. Wrap inputs in Axiom Tensors
-    X = tensor(X_raw, ax.b, ax.sq, ax.vocab)
+    # 3. Wrap inputs in Axiom Tensors (Rank 2)
+    X = tensor(x_ints, ax.b, ax.sq)
 
     # 4. The Dummy Pass (Triggers Axiom's dynamic memory allocation)
     _ = model(X)
@@ -126,18 +126,22 @@ def main():
     # 5. Initialize NNX Optimizer
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=1e-3), wrt=nnx.Param)
 
+    # Calculate exact parameter count to prove weight tying efficiency
+    params = nnx.state(model, nnx.Param)
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
+
     # 6. Define Scalar Loss Function
     def loss_fn(model, x_in, y_out):
         logits = model(x_in)
-        # Extract the raw .data array from the AxiomTensor for Optax
-        return optax.softmax_cross_entropy(logits.data, y_out).mean()
+        # Use integer label cross-entropy to match our dense labels
+        return optax.softmax_cross_entropy_with_integer_labels(logits.data, y_out).mean()
 
-    print(f"Model successfully compiled. Parameters allocated.")
+    print(f"Model successfully compiled. Total Parameters: {param_count:,}")
     print("Beginning Training Loop...\n")
 
     # 7. Execute Training
     for epoch in range(1, EPOCHS + 1):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, X, y_raw)
+        loss, grads = nnx.value_and_grad(loss_fn)(model, X, y_labels)
         optimizer.update(model, grads)
 
         if epoch % 5 == 0 or epoch == 1:

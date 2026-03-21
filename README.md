@@ -18,14 +18,94 @@ If your tensor math is structurally unsound, Axiom crashes at compile-time. If i
 
 ## 📦 Installation
 
-Axiom can be installed directly from GitHub.
+Axiom can be installed directly from GitHub. By default, installing the repository will only pull the core pure-Python packages, allowing it to seamlessly integrate into your existing JAX environment.
 
-**Using `uv` (Recommended):**
+To ensure XLA hardware acceleration is configured correctly from scratch, it is highly recommended to explicitly specify your backend during installation.
+
+### Using `uv` (recommended)
+
+Standard installation:
+
 ```bash
 uv add git+https://github.com/Adam-Jacuch/Axiom.git
 ```
 
-**Using `pip`:**
+Explicit CPU backend:
+
+```bash
+uv add "axiom[cpu] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+NVIDIA GPU acceleration (CUDA 12):
+
+```bash
+uv add "axiom[cuda] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+Bleeding-edge NVIDIA GPU acceleration (CUDA 13):
+
+```bash
+uv add "axiom[cuda13] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+AMD GPU / ROCm support:
+
+```bash
+uv add "axiom[amd] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+Google Cloud TPU acceleration:
+
+Because Google hosts TPU drivers independently of PyPI, you must install the official JAX TPU wheels directly from Google after installing Axiom.
+
+```bash
+# 1. Install Axiom (core)
+uv add git+https://github.com/Adam-Jacuch/Axiom.git
+
+# 2. Install Google's TPU drivers
+uv pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+### Using `pip`
+
+Standard installation:
+
 ```bash
 pip install git+https://github.com/Adam-Jacuch/Axiom.git
+```
+
+Explicit CPU backend:
+
+```bash
+pip install "axiom[cpu] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+NVIDIA GPU acceleration (CUDA 12):
+
+```bash
+pip install "axiom[cuda] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+Bleeding-edge NVIDIA GPU acceleration (CUDA 13):
+
+```bash
+pip install "axiom[cuda13] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+AMD GPU / ROCm support:
+
+```bash
+pip install "axiom[amd] @ git+https://github.com/Adam-Jacuch/Axiom.git"
+```
+
+Google Cloud TPU acceleration:
+
+Because Google hosts TPU drivers independently of PyPI, you must install the official JAX TPU wheels directly from Google after installing Axiom.
+
+```bash
+# 1. Install Axiom (core)
+pip install git+https://github.com/Adam-Jacuch/Axiom.git
+
+# 2. Install Google's TPU drivers
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
