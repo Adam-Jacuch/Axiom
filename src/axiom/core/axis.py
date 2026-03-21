@@ -92,6 +92,28 @@ class PackedAxis:
             return PackedAxis(*self.axes, other, ops=self.ops)
         raise TypeError("Can only pack Axis or PackedAxis.")
 
+    def __rshift__(self, other):
+        """Enables packing-to-alias domain mapping: (ax.a & ax.b) >> ax.c"""
+        import copy
+
+        # If the target is somehow another PackedAxis, safely copy it
+        if hasattr(other, 'axes'):
+            new_axis = copy.copy(other)
+            new_axis.source_name = getattr(self, 'source_name', self.name)
+            return new_axis
+
+        # Standard: Mapping a PackedAxis into a single logical Axis
+        new_name = other.name if hasattr(other, 'name') else str(other)
+        source = getattr(self, 'source_name', self.name)
+
+        # We instantiate a new regular Axis, but secretly tag it with the packed source name
+        return other.__class__(
+            new_name,
+            getattr(other, 'size', None),
+            getattr(other, 'ops', []),
+            source_name=source
+        )
+
     @property
     def name(self):
         return "&".join([a.name for a in self.axes])
