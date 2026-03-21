@@ -174,9 +174,18 @@ class Axis:
         raise TypeError("Can only pack Axis or PackedAxis.")
 
     def __rshift__(self, other):
-        """Enables in-flight renaming: ax.sq >> ax.sk"""
+        """Enables in-flight renaming: ax.sq >> ax.sk or ax.d >> (ax.s & ax.dh)"""
+        import copy
+
+        # If we are mapping into a PackedAxis (Unpacking via shift)
+        if hasattr(other, 'axes'):
+            new_packed = copy.copy(other)
+            # Tag the packed axis so the LHS parser knows it matches the physical 'd'
+            new_packed.source_name = getattr(self, 'source_name', self.name)
+            return new_packed
+
+        # Standard 1-to-1 axis renaming
         new_name = other.name if hasattr(other, 'name') else str(other)
-        # Preserve the original name as the 'source_name' so the parser can locate it!
         source = getattr(self, 'source_name', self.name)
         return self.__class__(new_name, self.size, self.ops, source_name=source)
 
