@@ -18,6 +18,14 @@ If your tensor math is structurally unsound, Axiom crashes at compile-time. If i
 
 ## 📦 Installation
 
-**For standard usage (via GitHub):**
+Axiom can be installed directly from GitHub.
+
+**Using `uv` (Recommended):**
 ```bash
-pip install git+[https://github.com/Adam-Jacuch/Axiom.git](https://github.com/Adam-Jacuch/Axiom.git)
+uv add git+https://github.com/Adam-Jacuch/Axiom.git
+```
+
+**Using `pip`:**
+```bash
+pip install git+https://github.com/Adam-Jacuch/Axiom.git
+```
