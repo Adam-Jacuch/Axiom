@@ -74,9 +74,12 @@ class AxiomTensor:
         explicit_names = set()
         for t in tokens:
             if t is Ellipsis: continue
-            if isinstance(t, PackedAxis):
+            if hasattr(t, 'source_name'):
+                # If the PackedAxis was mapped via '>>', use its top-level source!
+                explicit_names.add(t.source_name)
+            elif hasattr(t, 'axes'):
+                # Otherwise, it's a standard PackedAxis, so look at its children
                 explicit_names.update([getattr(a, 'source_name', a.name) for a in t.axes])
-                explicit_names.add(t.name)
             else:
                 explicit_names.add(getattr(t, 'source_name', t.name))
 
