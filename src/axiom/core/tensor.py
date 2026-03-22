@@ -365,7 +365,16 @@ class AxiomTensor:
             else:
                 explicit_names.add(getattr(t, "name", str(t)))
 
-        hidden_axes = [ax for ax in reference_axes if ax.name not in explicit_names]
+        hidden_axes = []
+        for ax in reference_axes:
+            if isinstance(ax, PackedAxis):
+                # If the packed name OR any of its child names are on the RHS, do not absorb it
+                if ax.name not in explicit_names and not any(a.name in explicit_names for a in ax.axes):
+                    hidden_axes.append(ax)
+            else:
+                if ax.name not in explicit_names:
+                    hidden_axes.append(ax)
+
         resolved = []
         for t in tokens:
             if t is Ellipsis:
