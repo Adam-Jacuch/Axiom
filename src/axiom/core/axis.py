@@ -1,6 +1,29 @@
 from axiom.exceptions import AxiomShapeError
 
 
+class SymbolicSize:
+    """Represents a deferred dimension size (e.g., ax.d * 2) to be resolved at runtime."""
+
+    def __init__(self, ref_name: str, op: str, value: int):
+        self.ref_name = ref_name
+        self.op = op
+        self.value = value
+
+    def resolve(self, size_map: dict) -> int:
+        if self.ref_name not in size_map:
+            raise AxiomShapeError(
+                f"Cannot resolve relative size: referenced axis '{self.ref_name}' is not in the current tensor."
+            )
+        ref_size = size_map[self.ref_name]
+
+        if self.op == "*": return ref_size * self.value
+        if self.op == "//": return ref_size // self.value
+        raise ValueError(f"Unknown symbolic op: {self.op}")
+
+    def __repr__(self):
+        return f"SymbolicSize({self.ref_name} {self.op} {self.value})"
+
+
 class ConsumedSlot:
     def __init__(self, source_name: str, op: str):
         self.source_name = source_name
@@ -38,14 +61,14 @@ class MaskOp:
 
 class ProjOp:
     def __init__(
-        self,
-        out_axis,
-        weight=None,
-        bias=None,
-        use_bias=True,
-        kernel_init=None,
-        bias_init=None,
-        dtype=None,
+            self,
+            out_axis,
+            weight=None,
+            bias=None,
+            use_bias=True,
+            kernel_init=None,
+            bias_init=None,
+            dtype=None,
     ):
         if bias is not None and use_bias:
             raise ValueError("proj(...): cannot provide explicit bias and also set use_bias=True.")
@@ -63,16 +86,16 @@ class ProjOp:
 
 class ConvOp:
     def __init__(
-        self,
-        features,
-        kernel_size,
-        strides=None,
-        padding="SAME",
-        use_bias=True,
-        kernel_init=None,
-        bias_init=None,
-        weight=None,
-        bias=None,
+            self,
+            features,
+            kernel_size,
+            strides=None,
+            padding="SAME",
+            use_bias=True,
+            kernel_init=None,
+            bias_init=None,
+            weight=None,
+            bias=None,
     ):
         if bias is not None and use_bias:
             raise ValueError("conv(...): cannot provide explicit bias and also set use_bias=True.")
@@ -110,15 +133,15 @@ class GateOp:
 
 class NormOp:
     def __init__(
-        self,
-        norm_type,
-        eps=1e-5,
-        use_bias=True,
-        use_scale=True,
-        init_scale=None,
-        init_bias=None,
-        scale=None,
-        bias=None,
+            self,
+            norm_type,
+            eps=1e-5,
+            use_bias=True,
+            use_scale=True,
+            init_scale=None,
+            init_bias=None,
+            scale=None,
+            bias=None,
     ):
         if norm_type not in ("rms", "layer"):
             raise ValueError("norm_type must be 'rms' or 'layer'.")
@@ -235,20 +258,20 @@ class PackedAxis:
     def size(self):
         total = 1
         for a in self.axes:
-            if a.size is None:
+            if a.size is None or hasattr(a.size, "resolve"):
                 return None
             total *= a.size
         return total
 
     def proj(
-        self,
-        out=None,
-        weight=None,
-        bias=None,
-        use_bias=True,
-        kernel_init=None,
-        bias_init=None,
-        dtype=None,
+            self,
+            out=None,
+            weight=None,
+            bias=None,
+            use_bias=True,
+            kernel_init=None,
+            bias_init=None,
+            dtype=None,
     ):
         out_axis = out if out is not None else self
         return self._spawn(
@@ -288,14 +311,14 @@ class PackedAxis:
         )
 
     def norm_layer(
-        self,
-        eps=1e-5,
-        use_bias=True,
-        use_scale=True,
-        scale=None,
-        bias=None,
-        init_scale=None,
-        init_bias=None,
+            self,
+            eps=1e-5,
+            use_bias=True,
+            use_scale=True,
+            scale=None,
+            bias=None,
+            init_scale=None,
+            init_bias=None,
     ):
         return self._spawn(
             list(self.ops) + [
@@ -344,23 +367,25 @@ class PackedAxis:
 
 
 class Axis:
-    def __init__(self, name: str, size: int = None, ops: list = None, source_name: str = None):
+    # Removed strict int type hint from size to cleanly allow SymbolicSize
+    def __init__(self, name: str, size=None, ops: list = None, source_name: str = None):
         self.name = name
         self.size = size
         self.ops = list(ops) if ops is not None else []
         self.source_name = source_name if source_name is not None else name
 
-    def __call__(self, size: int) -> "Axis":
+    def __call__(self, size) -> "Axis":
+        # Intercept and map sized dimensions transparently (e.g. ax.d2(ax.d * 2))
+        if isinstance(size, Axis):
+            size = size.size
         return Axis(self.name, size, list(self.ops), self.source_name)
 
     def __mul__(self, scalar: int):
         if not isinstance(scalar, int):
             raise TypeError("Axis dimensions must be multiplied by integers.")
-        if self.size is None:
-            raise AxiomShapeError(f"Cannot multiply axis '{self.name}' because its physical size is unknown.")
 
-        # Returns a new Axis with the scaled size, preserving ops and source identity
-        return Axis(self.name, self.size * scalar, list(self.ops), self.source_name)
+        new_size = self.size * scalar if self.size is not None else SymbolicSize(self.name, "*", scalar)
+        return Axis(self.name, new_size, list(self.ops), self.source_name)
 
     def __rmul__(self, scalar: int):
         return self.__mul__(scalar)
@@ -368,12 +393,15 @@ class Axis:
     def __floordiv__(self, scalar: int):
         if not isinstance(scalar, int):
             raise TypeError("Axis dimensions must be divided by integers.")
-        if self.size is None:
-            raise AxiomShapeError(f"Cannot divide axis '{self.name}' because its physical size is unknown.")
-        if self.size % scalar != 0:
-            raise AxiomShapeError(f"Axis '{self.name}' size {self.size} is not cleanly divisible by {scalar}.")
 
-        return Axis(self.name, self.size // scalar, list(self.ops), self.source_name)
+        if self.size is not None:
+            if self.size % scalar != 0:
+                raise AxiomShapeError(f"Axis '{self.name}' size {self.size} is not cleanly divisible by {scalar}.")
+            new_size = self.size // scalar
+        else:
+            new_size = SymbolicSize(self.name, "//", scalar)
+
+        return Axis(self.name, new_size, list(self.ops), self.source_name)
 
     def __and__(self, other):
         _validate_pack_operand(self)
@@ -398,14 +426,14 @@ class Axis:
         return self.__class__(new_name, self.size, list(self.ops), source_name=source)
 
     def proj(
-        self,
-        out=None,
-        weight=None,
-        bias=None,
-        use_bias=True,
-        kernel_init=None,
-        bias_init=None,
-        dtype=None,
+            self,
+            out=None,
+            weight=None,
+            bias=None,
+            use_bias=True,
+            kernel_init=None,
+            bias_init=None,
+            dtype=None,
     ):
         out_axis = out if out is not None else self
         new_ops = list(self.ops) + [
@@ -419,20 +447,19 @@ class Axis:
                 dtype=dtype,
             )
         ]
-        # Keep the current axis identity until the projection actually executes.
         return self.__class__(self.name, self.size, new_ops, getattr(self, "source_name", None))
 
     def conv(
-        self,
-        features,
-        kernel_size,
-        strides=None,
-        padding="SAME",
-        use_bias=True,
-        kernel_init=None,
-        bias_init=None,
-        weight=None,
-        bias=None,
+            self,
+            features,
+            kernel_size,
+            strides=None,
+            padding="SAME",
+            use_bias=True,
+            kernel_init=None,
+            bias_init=None,
+            weight=None,
+            bias=None,
     ):
         out_axis = features if isinstance(features, Axis) else Axis(self.name, features)
         new_ops = list(self.ops) + [
@@ -448,7 +475,6 @@ class Axis:
                 bias=bias,
             )
         ]
-        # Keep the current axis identity until the convolution actually executes.
         return Axis(self.name, self.size, new_ops, self.source_name)
 
     def bias(self, tensor=None, init_fn=None):
@@ -496,14 +522,14 @@ class Axis:
         )
 
     def norm_layer(
-        self,
-        eps=1e-5,
-        use_bias=True,
-        use_scale=True,
-        scale=None,
-        bias=None,
-        init_scale=None,
-        init_bias=None,
+            self,
+            eps=1e-5,
+            use_bias=True,
+            use_scale=True,
+            scale=None,
+            bias=None,
+            init_scale=None,
+            init_bias=None,
     ):
         return Axis(
             self.name,
@@ -536,7 +562,8 @@ class Axis:
         )
 
     def cast(self, dtype):
-        return self.__class__(self.name, self.size, list(self.ops) + [CastOp(dtype)], getattr(self, "source_name", None))
+        return self.__class__(self.name, self.size, list(self.ops) + [CastOp(dtype)],
+                              getattr(self, "source_name", None))
 
     def relu(self):
         return Axis(self.name, self.size, list(self.ops) + ["relu"], self.source_name)

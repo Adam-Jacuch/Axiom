@@ -19,10 +19,12 @@ from .axis import (
     PackedAxis,
     ProjOp,
     ScanOp,
+    SymbolicSize,
 )
 from .module import context
 from .. import init as a_init
 from ..exceptions import AxiomShapeError, AxiomSyntaxError
+
 
 class _AxiomIndexer:
     def __init__(self, owner: "AxiomTensor"):
@@ -30,6 +32,7 @@ class _AxiomIndexer:
 
     def __getitem__(self, item):
         return self._owner._positional_index(item)
+
 
 @jax.tree_util.register_pytree_node_class
 class AxiomTensor:
@@ -64,7 +67,29 @@ class AxiomTensor:
         new_axes = tuple(new_axis if a.name == old_axis.name else a for a in self.axes)
         return AxiomTensor(self.data, new_axes)
 
+    def _resolve_token_sizes(self, token, size_map: dict):
+        """Recursively evaluates SymbolicSize promises into concrete integers."""
+        if isinstance(token, Axis):
+            size = token.size.resolve(size_map) if hasattr(token.size, "resolve") else token.size
+            return Axis(token.name, size, list(token.ops), getattr(token, "source_name", token.name))
+        elif isinstance(token, PackedAxis):
+            new_axes = []
+            for a in token.axes:
+                size = a.size.resolve(size_map) if hasattr(a.size, "resolve") else a.size
+                new_axes.append(Axis(a.name, size, list(a.ops), getattr(a, "source_name", a.name)))
+            new_pack = PackedAxis(*new_axes, ops=list(token.ops))
+            if hasattr(token, "source_name"):
+                new_pack.source_name = token.source_name
+            return new_pack
+        return token
+
     def embed(self, out: Axis = None, vocab: int = None, weight=None, dtype=None, return_weight=False):
+        size_map = {a.name: int(self.data.shape[i]) for i, a in enumerate(self.axes)}
+        if out is not None:
+            out = self._resolve_token_sizes(out, size_map)
+        if hasattr(vocab, "resolve"):
+            vocab = vocab.resolve(size_map)
+
         if weight is not None:
             if not isinstance(weight, AxiomTensor):
                 raise TypeError("Explicit embed(weight=...) expects an AxiomTensor embedding table.")
@@ -181,7 +206,7 @@ class AxiomTensor:
         if Ellipsis in item:
             ellipsis_pos = item.index(Ellipsis)
             fill = len(self.axes) - specified
-            item = item[:ellipsis_pos] + (slice(None),) * fill + item[ellipsis_pos + 1 :]
+            item = item[:ellipsis_pos] + (slice(None),) * fill + item[ellipsis_pos + 1:]
         else:
             item = item + (slice(None),) * (len(self.axes) - specified)
 
@@ -418,14 +443,14 @@ class AxiomTensor:
         return jnp.array(jnp.finfo(dtype).min, dtype=dtype)
 
     def _apply_add_bias(
-        self,
-        current_data,
-        current_axis_names,
-        axis_idx,
-        explicit_bias=None,
-        use_implicit=False,
-        init_fn=None,
-        param_prefix="_axiom_bias",
+            self,
+            current_data,
+            current_axis_names,
+            axis_idx,
+            explicit_bias=None,
+            use_implicit=False,
+            init_fn=None,
+            param_prefix="_axiom_bias",
     ):
         if explicit_bias is not None:
             bias = self._align_explicit_operand(
@@ -440,19 +465,20 @@ class AxiomTensor:
         if use_implicit:
             init = init_fn if init_fn is not None else a_init.zeros
             bias_param = self._get_or_create_param(param_prefix, (current_data.shape[axis_idx],), init)
-            return current_data + self._broadcast_vector(bias_param, axis_idx, current_data.ndim).astype(current_data.dtype)
+            return current_data + self._broadcast_vector(bias_param, axis_idx, current_data.ndim).astype(
+                current_data.dtype)
 
         return current_data
 
     def _apply_mul_gate(
-        self,
-        current_data,
-        current_axis_names,
-        axis_idx,
-        explicit_gate=None,
-        use_implicit=False,
-        init_fn=None,
-        param_prefix="_axiom_gate",
+            self,
+            current_data,
+            current_axis_names,
+            axis_idx,
+            explicit_gate=None,
+            use_implicit=False,
+            init_fn=None,
+            param_prefix="_axiom_gate",
     ):
         if explicit_gate is not None:
             gate = self._align_explicit_operand(
@@ -467,19 +493,20 @@ class AxiomTensor:
         if use_implicit:
             init = init_fn if init_fn is not None else a_init.ones
             gate_param = self._get_or_create_param(param_prefix, (current_data.shape[axis_idx],), init)
-            return current_data * self._broadcast_vector(gate_param, axis_idx, current_data.ndim).astype(current_data.dtype)
+            return current_data * self._broadcast_vector(gate_param, axis_idx, current_data.ndim).astype(
+                current_data.dtype)
 
         return current_data
 
     def _apply_mul_scale(
-        self,
-        current_data,
-        current_axis_names,
-        axis_idx,
-        explicit_scale=None,
-        use_implicit=False,
-        init_fn=None,
-        param_prefix="_axiom_scale",
+            self,
+            current_data,
+            current_axis_names,
+            axis_idx,
+            explicit_scale=None,
+            use_implicit=False,
+            init_fn=None,
+            param_prefix="_axiom_scale",
     ):
         if explicit_scale is not None:
             scale = self._align_explicit_operand(
@@ -494,7 +521,8 @@ class AxiomTensor:
         if use_implicit:
             init = init_fn if init_fn is not None else a_init.ones
             scale_param = self._get_or_create_param(param_prefix, (current_data.shape[axis_idx],), init)
-            return current_data * self._broadcast_vector(scale_param, axis_idx, current_data.ndim).astype(current_data.dtype)
+            return current_data * self._broadcast_vector(scale_param, axis_idx, current_data.ndim).astype(
+                current_data.dtype)
 
         return current_data
 
@@ -503,10 +531,6 @@ class AxiomTensor:
     # -------------------------------------------------------------------------
 
     def _check_axis_rename_collision(self, current_axis_names, idx: int, new_name: str, where: str):
-        """
-        Raise early if replacing current_axis_names[idx] with new_name would create
-        duplicate logical axis names.
-        """
         old_name = current_axis_names[idx]
         if new_name != old_name and new_name in current_axis_names:
             raise AxiomShapeError(
@@ -533,26 +557,26 @@ class AxiomTensor:
             new_axes = [Axis(a.name, a.size, source_name=a.name) for a in token.axes]
 
             known_prod = 1
-            unknown_idxs = []
+            unknowns = []
             for i, a in enumerate(new_axes):
                 if a.size is None:
-                    unknown_idxs.append(i)
+                    unknowns.append(i)
                 else:
                     known_prod *= a.size
 
-            if len(unknown_idxs) == 0:
+            if len(unknowns) == 0:
                 total = math.prod(a.size for a in new_axes)
                 if total != physical_size:
                     raise AxiomShapeError(
                         f"Packed axis '{token.name}' expects size {total}, but physical size is {physical_size}."
                     )
-            elif len(unknown_idxs) == 1:
+            elif len(unknowns) == 1:
                 if known_prod == 0 or physical_size % known_prod != 0:
                     raise AxiomShapeError(
                         f"Cannot infer packed axis '{token.name}': physical size {physical_size} "
                         f"is not divisible by known factor {known_prod}."
                     )
-                i = unknown_idxs[0]
+                i = unknowns[0]
                 new_axes[i] = Axis(new_axes[i].name, physical_size // known_prod, source_name=new_axes[i].name)
 
             new = PackedAxis(*new_axes)
@@ -607,7 +631,8 @@ class AxiomTensor:
 
         alphabet = "QRSTUVWXYZABCDEFGHIJKLMNOP"
         if spatial_rank > len(alphabet):
-            raise AxiomShapeError(f"Conv with spatial rank {spatial_rank} is too large for symbolic dimension encoding.")
+            raise AxiomShapeError(
+                f"Conv with spatial rank {spatial_rank} is too large for symbolic dimension encoding.")
         spatial = alphabet[:spatial_rank]
         return ("N" + spatial + "C", spatial + "IO", "N" + spatial + "C")
 
@@ -632,7 +657,7 @@ class AxiomTensor:
             )
 
         batch_shape = x.shape[: x.ndim - spatial_rank - 1]
-        sample_shape = x.shape[x.ndim - spatial_rank - 1 :]
+        sample_shape = x.shape[x.ndim - spatial_rank - 1:]
         original_batch_shape = batch_shape
 
         if len(batch_shape) == 0:
@@ -853,23 +878,26 @@ class AxiomTensor:
                 current_data = jnp.swapaxes(scanned_out, 0, idx)
 
             elif isinstance(op, ProjOp):
+                # Dynamically resolve any symbolic output sizes right before executing
+                size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+                resolved_out_axis = self._resolve_token_sizes(op.out_axis, size_map)
+
                 in_features = int(current_data.shape[idx])
 
-                # EARLY collision check before any implicit module allocation path.
                 self._check_axis_rename_collision(
                     current_axis_names,
                     idx,
-                    op.out_axis.name,
+                    resolved_out_axis.name,
                     "projection output",
                 )
 
-                if op.weight is not None and isinstance(op.out_axis, PackedAxis):
+                if op.weight is not None and isinstance(resolved_out_axis, PackedAxis):
                     raise AxiomShapeError(
                         "Explicit proj(weight=...) does not currently support out=PackedAxis. "
                         "Project to a flat Axis, then unpack or route afterward."
                     )
 
-                out_features = self._resolve_proj_out_features(op.out_axis, in_features)
+                out_features = self._resolve_proj_out_features(resolved_out_axis, in_features)
 
                 if op.weight is None:
                     active_mod = self._require_active_module("Implicit .proj()")
@@ -907,7 +935,7 @@ class AxiomTensor:
                     self._assert_unique_names(rhs_names, "explicit projection weight")
 
                     contracted_name = current_axis_names[idx]
-                    out_name = op.out_axis.name
+                    out_name = resolved_out_axis.name
                     out_names = [out_name if n == contracted_name else n for n in lhs_names]
 
                     unique_names = self._ordered_unique(lhs_names + rhs_names + out_names)
@@ -925,15 +953,16 @@ class AxiomTensor:
                     idx = current_axis_names.index(out_name)
                     out_features = int(current_data.shape[idx])
 
-                current_axis_names[idx] = op.out_axis.name
+                current_axis_names[idx] = resolved_out_axis.name
                 self._assert_unique_names(current_axis_names, "projection output")
 
-                if isinstance(op.out_axis, PackedAxis):
-                    current_token = PackedAxis(*[Axis(a.name, a.size, source_name=a.name) for a in op.out_axis.axes])
-                    if hasattr(op.out_axis, "source_name"):
-                        current_token.source_name = op.out_axis.source_name
+                if isinstance(resolved_out_axis, PackedAxis):
+                    current_token = PackedAxis(
+                        *[Axis(a.name, a.size, source_name=a.name) for a in resolved_out_axis.axes])
+                    if hasattr(resolved_out_axis, "source_name"):
+                        current_token.source_name = resolved_out_axis.source_name
                 else:
-                    current_token = Axis(op.out_axis.name, out_features, source_name=op.out_axis.name)
+                    current_token = Axis(resolved_out_axis.name, out_features, source_name=resolved_out_axis.name)
 
                 current_data = self._apply_add_bias(
                     current_data,
@@ -946,20 +975,23 @@ class AxiomTensor:
                 )
 
             elif isinstance(op, ConvOp):
+                # Dynamically resolve any symbolic features size right before executing
+                size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+                resolved_features = self._resolve_token_sizes(op.features, size_map)
+
                 in_features = int(current_data.shape[idx])
 
-                # Early collision check here too, for consistency.
                 self._check_axis_rename_collision(
                     current_axis_names,
                     idx,
-                    op.features.name,
+                    resolved_features.name,
                     "conv output",
                 )
 
                 if op.weight is None:
-                    if op.features.size is None:
+                    if resolved_features.size is None:
                         raise AxiomShapeError("Implicit conv requires an explicit output feature size.")
-                    out_features = op.features.size
+                    out_features = resolved_features.size
 
                     active_mod = self._require_active_module("Implicit .conv()")
                     param_name = f"_axiom_conv_{active_mod._axiom_param_counter}"
@@ -989,17 +1021,17 @@ class AxiomTensor:
 
                 else:
                     current_data, out_features = self._apply_explicit_conv(current_data, idx, op)
-                    if op.features.size is None:
-                        op.features.size = out_features
-                    elif op.features.size != out_features:
+                    if resolved_features.size is None:
+                        resolved_features.size = out_features
+                    elif resolved_features.size != out_features:
                         raise AxiomShapeError(
-                            f"Explicit conv output feature mismatch: expected {op.features.size}, got {out_features}."
+                            f"Explicit conv output feature mismatch: expected {resolved_features.size}, got {out_features}."
                         )
 
-                current_axis_names[idx] = op.features.name
+                current_axis_names[idx] = resolved_features.name
                 self._assert_unique_names(current_axis_names, "conv output")
 
-                current_token = Axis(op.features.name, out_features, source_name=op.features.name)
+                current_token = Axis(resolved_features.name, out_features, source_name=resolved_features.name)
 
                 current_data = self._apply_add_bias(
                     current_data,
@@ -1034,6 +1066,10 @@ class AxiomTensor:
             lhs_tokens, rhs_tokens = tokens, None
 
         lhs_resolved = self._resolve_ellipsis(lhs_tokens, self.axes)
+
+        # Intercept and dynamically resolve any SymbolicSize objects parsed from the LHS
+        size_map = {a.name: int(self.data.shape[i]) for i, a in enumerate(self.axes)}
+        lhs_resolved = [self._resolve_token_sizes(t, size_map) for t in lhs_resolved]
 
         if len(lhs_resolved) != len(self.axes):
             raise AxiomShapeError("LHS logical axes do not match physical tensor rank.")
@@ -1104,6 +1140,10 @@ class AxiomTensor:
 
         if rhs_tokens is not None:
             rhs_resolved = self._resolve_ellipsis(rhs_tokens, tuple(surviving_tokens))
+
+            # Resolve RHS symbolic sizes using the state immediately before layout execution!
+            size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+            rhs_resolved = [self._resolve_token_sizes(t, size_map) for t in rhs_resolved]
 
             current_data, routing_tokens = self._normalize_surviving_for_rhs(current_data, surviving_tokens)
             lhs_names = [t.name for t in routing_tokens]

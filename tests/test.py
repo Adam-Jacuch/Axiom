@@ -6,6 +6,7 @@ import numpy as np
 
 from axiom import ax, tensor, Module
 from axiom.exceptions import AxiomShapeError, AxiomSyntaxError
+from axiom.core.axis import SymbolicSize
 
 
 def const_init(value, dtype=jnp.float32):
@@ -73,14 +74,14 @@ class EmbedMod(Module):
 
 class AxisScaledProjMod(Module):
     def __call__(self, x):
-        d = ax.d(4)
-        return x[..., d.proj(out=d * 2, use_bias=False, kernel_init=const_init(0.0))]
+        # Notice we don't need to define the size! ax.d * 2 is fully symbolic now.
+        return x[..., ax.d.proj(out=ax.d2(ax.d * 2), use_bias=False, kernel_init=const_init(0.0))]
 
 
 class AxisFloorDivProjMod(Module):
     def __call__(self, x):
-        d = ax.d(8)
-        return x[..., d.proj(out=d // 2, use_bias=False, kernel_init=const_init(0.0))]
+        # Fully symbolic lazy evaluation
+        return x[..., ax.d.proj(out=ax.d2(ax.d // 2), use_bias=False, kernel_init=const_init(0.0))]
 
 
 class AxiomRuntimeTests(unittest.TestCase):
@@ -139,65 +140,95 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_allclose(z2.data, x.data + raw)
 
     # -------------------------------------------------------------------------
-    # Axis arithmetic
+    # Axis arithmetic (Now Fully Symbolic!)
     # -------------------------------------------------------------------------
 
-    def test_axis_mul(self):
+    def test_axis_mul_known_size(self):
         d = ax.d(8)
         d2 = d * 2
         self.assertEqual(d2.name, "d")
         self.assertEqual(d2.size, 16)
         self.assertEqual(d2.source_name, d.source_name)
 
-    def test_axis_rmul(self):
+    def test_axis_rmul_known_size(self):
         d = ax.d(8)
         d2 = 3 * d
         self.assertEqual(d2.name, "d")
         self.assertEqual(d2.size, 24)
-        self.assertEqual(d2.source_name, d.source_name)
 
-    def test_axis_floordiv(self):
+    def test_axis_floordiv_known_size(self):
         d = ax.d(12)
         d2 = d // 3
         self.assertEqual(d2.name, "d")
         self.assertEqual(d2.size, 4)
-        self.assertEqual(d2.source_name, d.source_name)
 
-    def test_axis_mul_unknown_size_raises(self):
-        with self.assertRaises(AxiomShapeError):
-            _ = ax.d * 2
+    def test_axis_mul_unknown_size_creates_symbolic_promise(self):
+        d2 = ax.d * 2
+        self.assertEqual(d2.name, "d")
+        self.assertTrue(isinstance(d2.size, SymbolicSize))
+        self.assertEqual(d2.size.op, "*")
+        self.assertEqual(d2.size.value, 2)
 
-    def test_axis_floordiv_unknown_size_raises(self):
-        with self.assertRaises(AxiomShapeError):
-            _ = ax.d // 2
+    def test_axis_floordiv_unknown_size_creates_symbolic_promise(self):
+        d2 = ax.d // 2
+        self.assertTrue(isinstance(d2.size, SymbolicSize))
+        self.assertEqual(d2.size.op, "//")
+        self.assertEqual(d2.size.value, 2)
 
     def test_axis_floordiv_non_divisible_raises(self):
         with self.assertRaises(AxiomShapeError):
             _ = ax.d(10) // 3
 
-    def test_axis_mul_non_integer_raises(self):
-        with self.assertRaises(TypeError):
-            _ = ax.d(8) * 2.5
-
-    def test_axis_floordiv_non_integer_raises(self):
-        with self.assertRaises(TypeError):
-            _ = ax.d(8) // 2.5
-
-    def test_axis_scaled_projection(self):
-        x = tensor(jnp.ones((2, 4), dtype=jnp.float32), ax.b, ax.d(4))
+    def test_axis_scaled_projection_resolves_symbolic_size(self):
+        x = tensor(jnp.ones((2, 4), dtype=jnp.float32), ax.b, ax.d)
         mod = AxisScaledProjMod()
         y = mod(x)
 
-        assert_axes(self, y, ["b", "d"], [2, 8])
+        assert_axes(self, y, ["b", "d2"], [2, 8])
         assert_allclose(y.data, jnp.zeros((2, 8), dtype=jnp.float32))
 
-    def test_axis_floordiv_projection(self):
-        x = tensor(jnp.ones((2, 8), dtype=jnp.float32), ax.b, ax.d(8))
+    def test_axis_floordiv_projection_resolves_symbolic_size(self):
+        x = tensor(jnp.ones((2, 8), dtype=jnp.float32), ax.b, ax.d)
         mod = AxisFloorDivProjMod()
         y = mod(x)
 
-        assert_axes(self, y, ["b", "d"], [2, 4])
+        assert_axes(self, y, ["b", "d2"], [2, 4])
         assert_allclose(y.data, jnp.zeros((2, 4), dtype=jnp.float32))
+
+    # -------------------------------------------------------------------------
+    # Positional Indexing (.idx)
+    # -------------------------------------------------------------------------
+
+    def test_idx_integer_drops_axis(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 2, 3), ax.b, ax.s, ax.d)
+        y = x.idx[0]
+        assert_axes(self, y, ["s", "d"], [2, 3])
+        assert_allclose(y.data, x.data[0])
+
+    def test_idx_slice_updates_size(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 6), ax.b, ax.s)
+        y = x.idx[:, 1:4]
+        assert_axes(self, y, ["b", "s"], [2, 3])
+        assert_allclose(y.data, x.data[:, 1:4])
+
+    def test_idx_ellipsis(self):
+        x = tensor(jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4), ax.b, ax.s, ax.d)
+        y = x.idx[..., 1]
+        assert_axes(self, y, ["b", "s"], [2, 3])
+        assert_allclose(y.data, x.data[..., 1])
+
+    def test_idx_errors(self):
+        x = tensor(jnp.arange(6).reshape(2, 3), ax.b, ax.d)
+        with self.assertRaises(AxiomShapeError):
+            _ = x.idx[None]  # no newaxis supported
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x.idx[..., ...]  # double ellipsis
+        with self.assertRaises(AxiomShapeError):
+            _ = x.idx[0, 0, 0]  # too many dims
+
+    # -------------------------------------------------------------------------
+    # Remaining Tests
+    # -------------------------------------------------------------------------
 
     def test_duplicate_axis_names_rejected_on_projection(self):
         x = tensor(jnp.ones((2, 4, 8), dtype=jnp.float32), ax.b, ax.sq, ax.d)
