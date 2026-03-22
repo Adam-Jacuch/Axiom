@@ -1,3 +1,6 @@
+from axiom.exceptions import AxiomShapeError
+
+
 class ConsumedSlot:
     def __init__(self, source_name: str, op: str):
         self.source_name = source_name
@@ -349,6 +352,28 @@ class Axis:
 
     def __call__(self, size: int) -> "Axis":
         return Axis(self.name, size, list(self.ops), self.source_name)
+
+    def __mul__(self, scalar: int):
+        if not isinstance(scalar, int):
+            raise TypeError("Axis dimensions must be multiplied by integers.")
+        if self.size is None:
+            raise AxiomShapeError(f"Cannot multiply axis '{self.name}' because its physical size is unknown.")
+
+        # Returns a new Axis with the scaled size, preserving ops and source identity
+        return Axis(self.name, self.size * scalar, list(self.ops), self.source_name)
+
+    def __rmul__(self, scalar: int):
+        return self.__mul__(scalar)
+
+    def __floordiv__(self, scalar: int):
+        if not isinstance(scalar, int):
+            raise TypeError("Axis dimensions must be divided by integers.")
+        if self.size is None:
+            raise AxiomShapeError(f"Cannot divide axis '{self.name}' because its physical size is unknown.")
+        if self.size % scalar != 0:
+            raise AxiomShapeError(f"Axis '{self.name}' size {self.size} is not cleanly divisible by {scalar}.")
+
+        return Axis(self.name, self.size // scalar, list(self.ops), self.source_name)
 
     def __and__(self, other):
         _validate_pack_operand(self)

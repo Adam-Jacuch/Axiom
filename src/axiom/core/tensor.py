@@ -1,4 +1,5 @@
 import math
+import numbers
 from typing import Any, List, Tuple
 
 import jax
@@ -23,6 +24,12 @@ from .module import context
 from .. import init as a_init
 from ..exceptions import AxiomShapeError, AxiomSyntaxError
 
+class _AxiomIndexer:
+    def __init__(self, owner: "AxiomTensor"):
+        self._owner = owner
+
+    def __getitem__(self, item):
+        return self._owner._positional_index(item)
 
 @jax.tree_util.register_pytree_node_class
 class AxiomTensor:
@@ -125,6 +132,107 @@ class AxiomTensor:
             return out_tensor, w_tensor
 
         return out_tensor
+
+    @property
+    def idx(self):
+        return _AxiomIndexer(self)
+
+    def _is_int_index(self, token) -> bool:
+        return isinstance(token, numbers.Integral) and not isinstance(token, bool)
+
+    def _normalize_positional_index(self, item):
+        """
+        Normalize positional indexing into a full-rank tuple of only:
+        - int
+        - slice
+        - Ellipsis (expanded away)
+
+        Rules:
+        - Only one Ellipsis is allowed
+        - None / newaxis is not supported
+        - Fancy indexing is not supported
+        - If fewer indices than rank are provided, append trailing full slices
+        """
+        if not isinstance(item, tuple):
+            item = (item,)
+
+        if item.count(Ellipsis) > 1:
+            raise AxiomSyntaxError("idx[...] allows at most one ellipsis (...).")
+
+        for token in item:
+            if token is Ellipsis:
+                continue
+            if token is None:
+                raise AxiomShapeError("idx[...] does not support None / newaxis.")
+            if self._is_int_index(token):
+                continue
+            if isinstance(token, slice):
+                continue
+            raise AxiomShapeError(
+                f"idx[...] only supports integers, slices, and ellipsis. Got {type(token).__name__}."
+            )
+
+        specified = sum(token is not Ellipsis for token in item)
+        if specified > len(self.axes):
+            raise AxiomShapeError(
+                f"Too many indices for tensor rank {len(self.axes)}: got {specified} positional indices."
+            )
+
+        if Ellipsis in item:
+            ellipsis_pos = item.index(Ellipsis)
+            fill = len(self.axes) - specified
+            item = item[:ellipsis_pos] + (slice(None),) * fill + item[ellipsis_pos + 1 :]
+        else:
+            item = item + (slice(None),) * (len(self.axes) - specified)
+
+        return item
+
+    def _positional_index(self, item) -> "AxiomTensor":
+        """
+        Pure positional indexing escape hatch.
+
+        Examples:
+            x.idx[0]
+            x.idx[:, 2:8, :]
+            x.idx[..., 1]
+
+        Semantics:
+        - int drops the indexed axis
+        - slice keeps the axis and updates its size from the resulting tensor
+        - ellipsis expands to full slices
+        """
+        item = self._normalize_positional_index(item)
+
+        new_data = self.data[item]
+
+        new_axes = []
+        out_dim = 0
+        axis_idx = 0
+
+        for token in item:
+            axis = self.axes[axis_idx]
+
+            if self._is_int_index(token):
+                # JAX drops this physical dimension entirely.
+                axis_idx += 1
+                continue
+
+            if isinstance(token, slice):
+                new_axes.append(
+                    Axis(
+                        axis.name,
+                        int(new_data.shape[out_dim]),
+                        source_name=axis.source_name,
+                    )
+                )
+                out_dim += 1
+                axis_idx += 1
+                continue
+
+            # Should be unreachable because normalization validates everything.
+            raise AxiomShapeError(f"Unsupported idx token: {token!r}")
+
+        return AxiomTensor(new_data, tuple(new_axes))
 
     # -------------------------------------------------------------------------
     # Safety helpers

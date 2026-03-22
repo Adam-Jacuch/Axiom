@@ -4,8 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.axiom import ax, tensor, Module
-from src.axiom.exceptions import AxiomShapeError, AxiomSyntaxError
+from axiom import ax, tensor, Module
+from axiom.exceptions import AxiomShapeError, AxiomSyntaxError
 
 
 def const_init(value, dtype=jnp.float32):
@@ -71,6 +71,18 @@ class EmbedMod(Module):
         return x.embed(vocab=5, out=ax.d(3), return_weight=True)
 
 
+class AxisScaledProjMod(Module):
+    def __call__(self, x):
+        d = ax.d(4)
+        return x[..., d.proj(out=d * 2, use_bias=False, kernel_init=const_init(0.0))]
+
+
+class AxisFloorDivProjMod(Module):
+    def __call__(self, x):
+        d = ax.d(8)
+        return x[..., d.proj(out=d // 2, use_bias=False, kernel_init=const_init(0.0))]
+
+
 class AxiomRuntimeTests(unittest.TestCase):
     def test_axiomtensor_is_pytree_and_tree_map_roundtrips(self):
         x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.d)
@@ -125,6 +137,67 @@ class AxiomRuntimeTests(unittest.TestCase):
         z2 = x + raw
         assert_axes(self, z2, ["b", "d"], [None, None])
         assert_allclose(z2.data, x.data + raw)
+
+    # -------------------------------------------------------------------------
+    # Axis arithmetic
+    # -------------------------------------------------------------------------
+
+    def test_axis_mul(self):
+        d = ax.d(8)
+        d2 = d * 2
+        self.assertEqual(d2.name, "d")
+        self.assertEqual(d2.size, 16)
+        self.assertEqual(d2.source_name, d.source_name)
+
+    def test_axis_rmul(self):
+        d = ax.d(8)
+        d2 = 3 * d
+        self.assertEqual(d2.name, "d")
+        self.assertEqual(d2.size, 24)
+        self.assertEqual(d2.source_name, d.source_name)
+
+    def test_axis_floordiv(self):
+        d = ax.d(12)
+        d2 = d // 3
+        self.assertEqual(d2.name, "d")
+        self.assertEqual(d2.size, 4)
+        self.assertEqual(d2.source_name, d.source_name)
+
+    def test_axis_mul_unknown_size_raises(self):
+        with self.assertRaises(AxiomShapeError):
+            _ = ax.d * 2
+
+    def test_axis_floordiv_unknown_size_raises(self):
+        with self.assertRaises(AxiomShapeError):
+            _ = ax.d // 2
+
+    def test_axis_floordiv_non_divisible_raises(self):
+        with self.assertRaises(AxiomShapeError):
+            _ = ax.d(10) // 3
+
+    def test_axis_mul_non_integer_raises(self):
+        with self.assertRaises(TypeError):
+            _ = ax.d(8) * 2.5
+
+    def test_axis_floordiv_non_integer_raises(self):
+        with self.assertRaises(TypeError):
+            _ = ax.d(8) // 2.5
+
+    def test_axis_scaled_projection(self):
+        x = tensor(jnp.ones((2, 4), dtype=jnp.float32), ax.b, ax.d(4))
+        mod = AxisScaledProjMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "d"], [2, 8])
+        assert_allclose(y.data, jnp.zeros((2, 8), dtype=jnp.float32))
+
+    def test_axis_floordiv_projection(self):
+        x = tensor(jnp.ones((2, 8), dtype=jnp.float32), ax.b, ax.d(8))
+        mod = AxisFloorDivProjMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "d"], [2, 4])
+        assert_allclose(y.data, jnp.zeros((2, 4), dtype=jnp.float32))
 
     def test_duplicate_axis_names_rejected_on_projection(self):
         x = tensor(jnp.ones((2, 4, 8), dtype=jnp.float32), ax.b, ax.sq, ax.d)
