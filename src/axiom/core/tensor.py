@@ -70,17 +70,32 @@ class AxiomTensor:
     def _resolve_token_sizes(self, token, size_map: dict):
         """Recursively evaluates SymbolicSize promises into concrete integers."""
         if isinstance(token, Axis):
-            size = token.size.resolve(size_map) if hasattr(token.size, "resolve") else token.size
+            if hasattr(token.size, "resolve"):
+                size = token.size.resolve(size_map)
+            # --- ADD THESE TWO LINES ---
+            elif token.size is None and token.name in size_map:
+                size = size_map[token.name]
+            # ---------------------------
+            else:
+                size = token.size
             return Axis(token.name, size, list(token.ops), getattr(token, "source_name", token.name))
+
         elif isinstance(token, PackedAxis):
             new_axes = []
             for a in token.axes:
-                size = a.size.resolve(size_map) if hasattr(a.size, "resolve") else a.size
+                if hasattr(a.size, "resolve"):
+                    size = a.size.resolve(size_map)
+                elif a.size is None and a.name in size_map:
+                    size = size_map[a.name]
+                else:
+                    size = a.size
                 new_axes.append(Axis(a.name, size, list(a.ops), getattr(a, "source_name", a.name)))
+
             new_pack = PackedAxis(*new_axes, ops=list(token.ops))
             if hasattr(token, "source_name"):
                 new_pack.source_name = token.source_name
             return new_pack
+
         return token
 
     def embed(self, out: Axis = None, vocab: int = None, weight=None, dtype=None, return_weight=False):
