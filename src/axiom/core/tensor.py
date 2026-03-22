@@ -594,28 +594,15 @@ class AxiomTensor:
 
     def _resolve_proj_out_features(self, out_axis, in_features: int):
         if isinstance(out_axis, PackedAxis):
-            known_size = 1
-            unknowns = []
+            out_features = 1
             for a in out_axis.axes:
                 if a.size is None:
-                    unknowns.append(a)
-                else:
-                    known_size *= a.size
-
-            if len(unknowns) > 1:
-                raise AxiomShapeError(
-                    "Projection into a PackedAxis requires all but at most one sub-axis size to be known."
-                )
-
-            if len(unknowns) == 1:
-                if in_features % known_size != 0:
                     raise AxiomShapeError(
-                        f"Cannot infer packed projection size: input dim {in_features} is not divisible by known factor {known_size}."
+                        f"Cannot implicitly infer output size for '{a.name}' during a projection. "
+                        "All dimensions in a projection target must have known sizes."
                     )
-                unknowns[0].size = in_features // known_size
-                return in_features
-
-            return known_size
+                out_features *= a.size
+            return out_features
 
         if out_axis.size is None:
             out_axis.size = in_features
