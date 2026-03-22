@@ -4,72 +4,151 @@ class ConsumedSlot:
         self.op = op
 
     @property
-    def name(self): return self.source_name
+    def name(self):
+        return self.source_name
 
-    def __repr__(self): return f"ConsumedSlot('{self.source_name}', op='{self.op}')"
+    def __repr__(self):
+        return f"ConsumedSlot('{self.source_name}', op='{self.op}')"
 
 
 class CastOp:
     def __init__(self, dtype):
         self.dtype = dtype
-    def __repr__(self): return f"CastOp({self.dtype.__name__})"
+
+    def __repr__(self):
+        return f"CastOp({self.dtype.__name__})"
+
+
+class MaskOp:
+    def __init__(self, kind: str, other_axis: str = "left", fill_value=None):
+        if kind not in ("tril", "triu"):
+            raise ValueError("mask() currently supports only 'tril' and 'triu'.")
+        if other_axis != "left":
+            raise ValueError("mask() currently supports only other_axis='left'.")
+        self.kind = kind
+        self.other_axis = other_axis
+        self.fill_value = fill_value
+
+    def __repr__(self):
+        return f"MaskOp(kind='{self.kind}', other_axis='{self.other_axis}')"
 
 
 class ProjOp:
-    def __init__(self, out_axis, weight=None, use_bias=False, kernel_init=None, bias_init=None, dtype=None):
+    def __init__(
+        self,
+        out_axis,
+        weight=None,
+        bias=None,
+        use_bias=True,
+        kernel_init=None,
+        bias_init=None,
+        dtype=None,
+    ):
+        if bias is not None and use_bias:
+            raise ValueError("proj(...): cannot provide explicit bias and also set use_bias=True.")
         self.out_axis = out_axis
         self.weight = weight
+        self.bias = bias
         self.use_bias = use_bias
         self.kernel_init = kernel_init
         self.bias_init = bias_init
         self.dtype = dtype
 
-    def __repr__(self): return f"ProjOp(out={self.out_axis.name})"
+    def __repr__(self):
+        return f"ProjOp(out={self.out_axis.name}, use_bias={self.use_bias})"
 
 
 class ConvOp:
-    def __init__(self, features, kernel_size, strides=None, padding='SAME', use_bias=True, kernel_init=None, bias_init=None):
+    def __init__(
+        self,
+        features,
+        kernel_size,
+        strides=None,
+        padding="SAME",
+        use_bias=True,
+        kernel_init=None,
+        bias_init=None,
+        weight=None,
+        bias=None,
+    ):
+        if bias is not None and use_bias:
+            raise ValueError("conv(...): cannot provide explicit bias and also set use_bias=True.")
         self.features = features
-        self.kernel_size = kernel_size
-        self.strides = strides if strides else (1,) * len(kernel_size)
+        self.kernel_size = tuple(kernel_size)
+        self.strides = tuple(strides) if strides is not None else (1,) * len(self.kernel_size)
         self.padding = padding
         self.use_bias = use_bias
         self.kernel_init = kernel_init
         self.bias_init = bias_init
-    def __repr__(self): return f"ConvOp(kernel_size={self.kernel_size})"
+        self.weight = weight
+        self.bias = bias
+
+    def __repr__(self):
+        return f"ConvOp(kernel_size={self.kernel_size}, use_bias={self.use_bias})"
 
 
 class BiasOp:
-    def __init__(self, init_fn=None):
+    def __init__(self, tensor=None, init_fn=None):
+        self.tensor = tensor
         self.init_fn = init_fn
 
-    def __repr__(self): return "BiasOp()"
+    def __repr__(self):
+        return "BiasOp()"
 
 
 class GateOp:
-    def __init__(self, gate_tensor):
-        self.gate_tensor = gate_tensor
+    def __init__(self, tensor=None, init_fn=None):
+        self.tensor = tensor
+        self.init_fn = init_fn
 
-    def __repr__(self): return "GateOp()"
+    def __repr__(self):
+        return "GateOp()"
 
 
 class NormOp:
-    def __init__(self, norm_type, eps=1e-5, use_bias=True, use_scale=True, init_scale=None, init_bias=None):
+    def __init__(
+        self,
+        norm_type,
+        eps=1e-5,
+        use_bias=True,
+        use_scale=True,
+        init_scale=None,
+        init_bias=None,
+        scale=None,
+        bias=None,
+    ):
+        if norm_type not in ("rms", "layer"):
+            raise ValueError("norm_type must be 'rms' or 'layer'.")
+
+        if norm_type == "rms":
+            if bias is not None or use_bias:
+                raise ValueError("norm_rms() does not support bias.")
+        else:
+            if bias is not None and use_bias:
+                raise ValueError("norm_layer(...): cannot provide explicit bias and also set use_bias=True.")
+
+        if scale is not None and use_scale:
+            raise ValueError("norm(...): cannot provide explicit scale and also set use_scale=True.")
+
         self.norm_type = norm_type
         self.eps = eps
         self.use_bias = use_bias
         self.use_scale = use_scale
         self.init_scale = init_scale
         self.init_bias = init_bias
+        self.scale = scale
+        self.bias = bias
 
-    def __repr__(self): return f"NormOp('{self.norm_type}')"
+    def __repr__(self):
+        return f"NormOp('{self.norm_type}')"
 
 
 class DropoutOp:
     def __init__(self, rate):
         self.rate = rate
 
-    def __repr__(self): return f"DropoutOp({self.rate})"
+    def __repr__(self):
+        return f"DropoutOp({self.rate})"
 
 
 class ScanOp:
@@ -77,41 +156,72 @@ class ScanOp:
         self.fn = fn
         self.inputs = inputs
 
-    def __repr__(self): return f"ScanOp(fn={self.fn.__name__})"
+    def __repr__(self):
+        return f"ScanOp(fn={self.fn.__name__})"
+
+
+def _validate_pack_child(axis):
+    if not isinstance(axis, Axis):
+        raise TypeError("PackedAxis children must be Axis objects.")
+    if axis.ops:
+        raise ValueError(
+            f"Cannot pack axis '{axis.name}' because it already carries ops. "
+            f"Apply ops before or after packing, not on child axes inside a pack."
+        )
+
+
+def _validate_pack_operand(obj):
+    if isinstance(obj, PackedAxis):
+        if obj.ops:
+            raise ValueError(
+                f"Cannot further pack PackedAxis('{obj.name}') because it already carries packed ops."
+            )
+        for a in obj.axes:
+            _validate_pack_child(a)
+    elif isinstance(obj, Axis):
+        _validate_pack_child(obj)
+    else:
+        raise TypeError("Can only pack Axis or PackedAxis.")
 
 
 class PackedAxis:
     def __init__(self, *axes, ops=None):
-        self.axes = axes
-        self.ops = ops or []
+        for a in axes:
+            _validate_pack_child(a)
+        self.axes = tuple(axes)
+        self.ops = list(ops) if ops is not None else []
+
+    def _spawn(self, ops=None):
+        new = PackedAxis(*self.axes, ops=list(self.ops if ops is None else ops))
+        if hasattr(self, "source_name"):
+            new.source_name = self.source_name
+        return new
 
     def __and__(self, other):
+        _validate_pack_operand(self)
+        _validate_pack_operand(other)
+
         if isinstance(other, PackedAxis):
-            return PackedAxis(*self.axes, *other.axes, ops=self.ops)
-        elif isinstance(other, 'Axis'):
-            return PackedAxis(*self.axes, other, ops=self.ops)
+            return PackedAxis(*self.axes, *other.axes, ops=list(self.ops))
+        if isinstance(other, Axis):
+            return PackedAxis(*self.axes, other, ops=list(self.ops))
         raise TypeError("Can only pack Axis or PackedAxis.")
 
     def __rshift__(self, other):
-        """Enables packing-to-alias domain mapping: (ax.a & ax.b) >> ax.c"""
         import copy
 
-        # If the target is somehow another PackedAxis, safely copy it
-        if hasattr(other, 'axes'):
+        if hasattr(other, "axes"):
             new_axis = copy.copy(other)
-            new_axis.source_name = getattr(self, 'source_name', self.name)
+            new_axis.source_name = getattr(self, "source_name", self.name)
             return new_axis
 
-        # Standard: Mapping a PackedAxis into a single logical Axis
-        new_name = other.name if hasattr(other, 'name') else str(other)
-        source = getattr(self, 'source_name', self.name)
-
-        # We instantiate a new regular Axis, but secretly tag it with the packed source name
+        new_name = other.name if hasattr(other, "name") else str(other)
+        source = getattr(self, "source_name", self.name)
         return other.__class__(
             new_name,
-            getattr(other, 'size', None),
-            getattr(other, 'ops', []),
-            source_name=source
+            getattr(other, "size", None),
+            list(getattr(other, "ops", [])),
+            source_name=source,
         )
 
     @property
@@ -122,57 +232,109 @@ class PackedAxis:
     def size(self):
         total = 1
         for a in self.axes:
-            if a.size is None: return None
+            if a.size is None:
+                return None
             total *= a.size
         return total
 
-    # --- Standard Lib ---
-    def proj(self, out=None, weight=None, use_bias=False, kernel_init=None, bias_init=None, dtype=None):
+    def proj(
+        self,
+        out=None,
+        weight=None,
+        bias=None,
+        use_bias=True,
+        kernel_init=None,
+        bias_init=None,
+        dtype=None,
+    ):
         out_axis = out if out is not None else self
-        import copy
-        new_packed = copy.copy(self) # Safely duplicates without triggering __init__
-        new_packed.ops = self.ops + [ProjOp(out_axis, weight, use_bias, kernel_init, bias_init, dtype)]
-        return new_packed
+        return self._spawn(
+            list(self.ops) + [
+                ProjOp(
+                    out_axis,
+                    weight=weight,
+                    bias=bias,
+                    use_bias=use_bias,
+                    kernel_init=kernel_init,
+                    bias_init=bias_init,
+                    dtype=dtype,
+                )
+            ]
+        )
 
-    def bias(self, init_fn=None):
-        return PackedAxis(*self.axes, ops=self.ops + [BiasOp(init_fn)])
+    def bias(self, tensor=None, init_fn=None):
+        return self._spawn(list(self.ops) + [BiasOp(tensor=tensor, init_fn=init_fn)])
 
-    def gate(self, tensor):
-        return PackedAxis(*self.axes, ops=self.ops + [GateOp(tensor)])
+    def gate(self, tensor=None, init_fn=None):
+        return self._spawn(list(self.ops) + [GateOp(tensor=tensor, init_fn=init_fn)])
 
-    def norm_rms(self, eps=1e-5, init_scale=None):
-        return PackedAxis(*self.axes, ops=self.ops + [NormOp('rms', eps, False, True, init_scale, None)])
+    def norm_rms(self, eps=1e-5, scale=None, init_scale=None):
+        return self._spawn(
+            list(self.ops) + [
+                NormOp(
+                    "rms",
+                    eps,
+                    use_bias=False,
+                    use_scale=(scale is None),
+                    init_scale=init_scale,
+                    init_bias=None,
+                    scale=scale,
+                    bias=None,
+                )
+            ]
+        )
 
-    def norm_layer(self, eps=1e-5, use_bias=True, use_scale=True):
-        return PackedAxis(*self.axes, ops=self.ops + [NormOp('layer', eps, use_bias, use_scale)])
+    def norm_layer(
+        self,
+        eps=1e-5,
+        use_bias=True,
+        use_scale=True,
+        scale=None,
+        bias=None,
+        init_scale=None,
+        init_bias=None,
+    ):
+        return self._spawn(
+            list(self.ops) + [
+                NormOp(
+                    "layer",
+                    eps,
+                    use_bias=use_bias,
+                    use_scale=use_scale,
+                    init_scale=init_scale,
+                    init_bias=init_bias,
+                    scale=scale,
+                    bias=bias,
+                )
+            ]
+        )
 
     def dropout(self, rate=0.1):
-        return PackedAxis(*self.axes, ops=self.ops + [DropoutOp(rate)])
+        return self._spawn(list(self.ops) + [DropoutOp(rate)])
 
     def scan(self, fn, inputs=None):
-        return PackedAxis(*self.axes, ops=self.ops + [ScanOp(fn, inputs if inputs is not None else tuple())])
+        return self._spawn(list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple())])
 
     def cast(self, dtype):
-        return self.__class__(self.name, self.size, self.ops + [CastOp(dtype)], getattr(self, 'source_name', None))
+        return self._spawn(list(self.ops) + [CastOp(dtype)])
 
-    # --- Activations ---
     def relu(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['relu'])
+        return self._spawn(list(self.ops) + ["relu"])
 
     def silu(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['silu'])
+        return self._spawn(list(self.ops) + ["silu"])
 
     def gelu(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['gelu'])
+        return self._spawn(list(self.ops) + ["gelu"])
 
     def sigmoid(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['sigmoid'])
+        return self._spawn(list(self.ops) + ["sigmoid"])
 
     def tanh(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['tanh'])
+        return self._spawn(list(self.ops) + ["tanh"])
 
     def softmax(self):
-        return PackedAxis(*self.axes, ops=self.ops + ['softmax'])
+        return self._spawn(list(self.ops) + ["softmax"])
 
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
@@ -182,110 +344,210 @@ class Axis:
     def __init__(self, name: str, size: int = None, ops: list = None, source_name: str = None):
         self.name = name
         self.size = size
-        self.ops = ops or []
+        self.ops = list(ops) if ops is not None else []
         self.source_name = source_name if source_name is not None else name
 
-    def __call__(self, size: int) -> 'Axis':
+    def __call__(self, size: int) -> "Axis":
         return Axis(self.name, size, list(self.ops), self.source_name)
 
     def __and__(self, other):
+        _validate_pack_operand(self)
+        _validate_pack_operand(other)
+
         if isinstance(other, PackedAxis):
             return PackedAxis(self, *other.axes)
-        elif isinstance(other, Axis):
+        if isinstance(other, Axis):
             return PackedAxis(self, other)
         raise TypeError("Can only pack Axis or PackedAxis.")
 
     def __rshift__(self, other):
-        """Enables in-flight renaming: ax.sq >> ax.sk or ax.d >> (ax.s & ax.dh)"""
         import copy
 
-        # If we are mapping into a PackedAxis (Unpacking via shift)
-        if hasattr(other, 'axes'):
+        if hasattr(other, "axes"):
             new_packed = copy.copy(other)
-            # Tag the packed axis so the LHS parser knows it matches the physical 'd'
-            new_packed.source_name = getattr(self, 'source_name', self.name)
+            new_packed.source_name = getattr(self, "source_name", self.name)
             return new_packed
 
-        # Standard 1-to-1 axis renaming
-        new_name = other.name if hasattr(other, 'name') else str(other)
-        source = getattr(self, 'source_name', self.name)
-        return self.__class__(new_name, self.size, self.ops, source_name=source)
+        new_name = other.name if hasattr(other, "name") else str(other)
+        source = getattr(self, "source_name", self.name)
+        return self.__class__(new_name, self.size, list(self.ops), source_name=source)
 
-    # --- Standard Lib ---
-    def proj(self, out=None, weight=None, use_bias=False, kernel_init=None, bias_init=None, dtype=None):
+    def proj(
+        self,
+        out=None,
+        weight=None,
+        bias=None,
+        use_bias=True,
+        kernel_init=None,
+        bias_init=None,
+        dtype=None,
+    ):
         out_axis = out if out is not None else self
-        new_ops = self.ops + [ProjOp(out_axis, weight, use_bias, kernel_init, bias_init, dtype)]
-        return self.__class__(out_axis.name, out_axis.size, new_ops, getattr(self, 'source_name', None))
+        new_ops = list(self.ops) + [
+            ProjOp(
+                out_axis,
+                weight=weight,
+                bias=bias,
+                use_bias=use_bias,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                dtype=dtype,
+            )
+        ]
+        # Keep the current axis identity until the projection actually executes.
+        return self.__class__(self.name, self.size, new_ops, getattr(self, "source_name", None))
 
-    def conv(self, features, kernel_size, strides=None, padding='SAME', use_bias=True, kernel_init=None,
-             bias_init=None):
+    def conv(
+        self,
+        features,
+        kernel_size,
+        strides=None,
+        padding="SAME",
+        use_bias=True,
+        kernel_init=None,
+        bias_init=None,
+        weight=None,
+        bias=None,
+    ):
         out_axis = features if isinstance(features, Axis) else Axis(self.name, features)
-        new_ops = self.ops + [ConvOp(out_axis, kernel_size, strides, padding, use_bias, kernel_init, bias_init)]
-        return Axis(out_axis.name, out_axis.size, new_ops, self.source_name)
+        new_ops = list(self.ops) + [
+            ConvOp(
+                out_axis,
+                kernel_size,
+                strides=strides,
+                padding=padding,
+                use_bias=use_bias,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                weight=weight,
+                bias=bias,
+            )
+        ]
+        # Keep the current axis identity until the convolution actually executes.
+        return Axis(self.name, self.size, new_ops, self.source_name)
 
-    def bias(self, init_fn=None):
-        return Axis(self.name, self.size, self.ops + [BiasOp(init_fn)], self.source_name)
+    def bias(self, tensor=None, init_fn=None):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [BiasOp(tensor=tensor, init_fn=init_fn)],
+            self.source_name,
+        )
 
-    def gate(self, tensor):
-        return Axis(self.name, self.size, self.ops + [GateOp(tensor)], self.source_name)
+    def gate(self, tensor=None, init_fn=None):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [GateOp(tensor=tensor, init_fn=init_fn)],
+            self.source_name,
+        )
 
-    def mask(self, mask_type: str):
-        return Axis(self.name, self.size, self.ops + [f'mask_{mask_type}'], self.source_name)
+    def mask(self, kind: str, other_axis: str = "left", fill_value=None):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [MaskOp(kind=kind, other_axis=other_axis, fill_value=fill_value)],
+            self.source_name,
+        )
 
-    def norm_rms(self, eps=1e-5, init_scale=None):
-        return Axis(self.name, self.size, self.ops + [NormOp('rms', eps, False, True, init_scale, None)],
-                    self.source_name)
+    def norm_rms(self, eps=1e-5, scale=None, init_scale=None):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops)
+            + [
+                NormOp(
+                    "rms",
+                    eps,
+                    use_bias=False,
+                    use_scale=(scale is None),
+                    init_scale=init_scale,
+                    init_bias=None,
+                    scale=scale,
+                    bias=None,
+                )
+            ],
+            self.source_name,
+        )
 
-    def norm_layer(self, eps=1e-5, use_bias=True, use_scale=True):
-        return Axis(self.name, self.size, self.ops + [NormOp('layer', eps, use_bias, use_scale)], self.source_name)
+    def norm_layer(
+        self,
+        eps=1e-5,
+        use_bias=True,
+        use_scale=True,
+        scale=None,
+        bias=None,
+        init_scale=None,
+        init_bias=None,
+    ):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops)
+            + [
+                NormOp(
+                    "layer",
+                    eps,
+                    use_bias=use_bias,
+                    use_scale=use_scale,
+                    init_scale=init_scale,
+                    init_bias=init_bias,
+                    scale=scale,
+                    bias=bias,
+                )
+            ],
+            self.source_name,
+        )
 
     def dropout(self, rate=0.1):
-        return Axis(self.name, self.size, self.ops + [DropoutOp(rate)], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + [DropoutOp(rate)], self.source_name)
 
     def scan(self, fn, inputs=None):
-        return Axis(self.name, self.size, self.ops + [ScanOp(fn, inputs if inputs is not None else tuple())],
-                    self.source_name)
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple())],
+            self.source_name,
+        )
 
     def cast(self, dtype):
-        return self.__class__(self.name, self.size, self.ops + [CastOp(dtype)], getattr(self, 'source_name', None))
+        return self.__class__(self.name, self.size, list(self.ops) + [CastOp(dtype)], getattr(self, "source_name", None))
 
-    # --- Activations ---
     def relu(self):
-        return Axis(self.name, self.size, self.ops + ['relu'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["relu"], self.source_name)
 
     def silu(self):
-        return Axis(self.name, self.size, self.ops + ['silu'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["silu"], self.source_name)
 
     def gelu(self):
-        return Axis(self.name, self.size, self.ops + ['gelu'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["gelu"], self.source_name)
 
     def sigmoid(self):
-        return Axis(self.name, self.size, self.ops + ['sigmoid'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["sigmoid"], self.source_name)
 
     def tanh(self):
-        return Axis(self.name, self.size, self.ops + ['tanh'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["tanh"], self.source_name)
 
     def softmax(self):
-        return Axis(self.name, self.size, self.ops + ['softmax'], self.source_name)
+        return Axis(self.name, self.size, list(self.ops) + ["softmax"], self.source_name)
 
-    # --- Reductions ---
     def sum(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'sum')
+        return ConsumedSlot(self.name, "sum")
 
     def mean(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'mean')
+        return ConsumedSlot(self.name, "mean")
 
     def max(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'max')
+        return ConsumedSlot(self.name, "max")
 
     def min(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'min')
+        return ConsumedSlot(self.name, "min")
 
     def var(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'var')
+        return ConsumedSlot(self.name, "var")
 
     def std(self) -> ConsumedSlot:
-        return ConsumedSlot(self.source_name, 'std')
+        return ConsumedSlot(self.name, "std")
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"

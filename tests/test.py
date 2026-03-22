@@ -1,154 +1,494 @@
-"""
-Axiom Quickstart & Feature Showcase
------------------------------------
-This script demonstrates the core capabilities of the Axiom eDSL, including:
-1. Named-Axis Routing (->)
-2. Axis Packing & Unpacking (&)
-3. Implicit Memory Allocation (.proj, .norm_rms)
-4. Mixed Precision Training (bfloat16 & .cast)
-5. XLA-Compiled Training Loops
-6. Rank-Altering Embeddings & Tied Weights
-"""
+import unittest
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-import optax
-import math
+import numpy as np
 
-# Assuming this is run from the root of the Axiom repository
-from src.axiom import ax, tensor, Module, init
+from src.axiom import ax, tensor, Module
+from src.axiom.exceptions import AxiomShapeError, AxiomSyntaxError
 
 
-# =============================================================================
-# 1. Multi-Head Attention (Showcasing Routing, Packing & Explicit Contraction)
-# =============================================================================
-class Attention(Module):
-    def __init__(self, dim: int, heads: int):
-        self.dim = dim
-        self.heads = heads
-        self.dh_size = dim // heads
+def const_init(value, dtype=jnp.float32):
+    def _init(rng, shape, param_dtype=None):
+        use_dtype = dtype if param_dtype is None else param_dtype
+        return jnp.full(shape, value, dtype=use_dtype)
+    return _init
 
+
+def assert_axes(testcase: unittest.TestCase, t, names, sizes=None):
+    got_names = [a.name for a in t.axes]
+    testcase.assertEqual(got_names, list(names))
+    if sizes is not None:
+        got_sizes = [a.size for a in t.axes]
+        testcase.assertEqual(got_sizes, list(sizes))
+
+
+def assert_allclose(x, y, atol=1e-5, rtol=1e-5):
+    np.testing.assert_allclose(np.asarray(x), np.asarray(y), atol=atol, rtol=rtol)
+
+
+class ProjDefaultBiasMod(Module):
     def __call__(self, x):
-        # 1. Q keeps the 'sq' axis
-        q = x[..., ax.d.proj(out=ax.h(self.heads) & ax.dh(self.dh_size))]
-
-        # 2. In-Flight Rename! 'sq' maps to 'sk', while 'd' is projected and packed.
-        k = x[..., (ax.sq >> ax.sk), ax.d.proj(out=ax.h(self.heads) & ax.dh(self.dh_size))]
-        v = x[..., (ax.sq >> ax.sk), ax.d.proj(out=ax.h(self.heads) & ax.dh(self.dh_size))]
-
-        # 3. Unpack and Route
-        q = q[ax.b, ax.sq, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sq, ax.dh]
-        k = k[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
-        v = v[ax.b, ax.sk, ax.h(self.heads) & ax.dh, "->", ax.b, ax.h, ax.sk, ax.dh]
-
-        # 4. Einsum Contraction
-        scores = q[..., ax.dh.proj(out=ax.sk, weight=k)]
-
-        # 5. Scale & Causal Mask
-        probs = (scores / math.sqrt(self.dh_size))[..., ax.sk.mask('tril').softmax()]
-
-        # 6. Aggregate & Repack
-        out_ctx = probs[..., ax.sk.proj(out=ax.dh, weight=v)]
-        repacked = out_ctx[..., "->", ax.b, ax.sq, ax.h & ax.dh]
-
-        return repacked[..., (ax.h & ax.dh).proj(out=ax.d(self.dim))]
+        return x[..., ax.d.proj(
+            out=ax.o(3),
+            kernel_init=const_init(0.0),
+            bias_init=const_init(2.0),
+        )]
 
 
-# =============================================================================
-# 2. Feed Forward Block (Showcasing Mixed Precision & Casting)
-# =============================================================================
-class FeedForward(Module):
-    def __init__(self, dim: int, expansion: int = 4):
-        self.dim = dim
-        self.hidden_dim = dim * expansion
-
+class ProjNoBiasMod(Module):
     def __call__(self, x):
-        # Run heavy MLPs in bfloat16 for Tensor Core acceleration
-        h = x[..., ax.d.proj(out=ax.hd(self.hidden_dim), dtype=jnp.bfloat16).silu()]
-        out = h[..., ax.hd.proj(out=ax.d(self.dim), dtype=jnp.bfloat16)]
+        return x[..., ax.d.proj(
+            out=ax.o(3),
+            use_bias=False,
+            kernel_init=const_init(0.0),
+            bias_init=const_init(2.0),
+        )]
 
-        # Safely cast back to float32 before returning to the residual stream!
-        return out[..., ax.d.cast(jnp.float32)]
 
-
-# =============================================================================
-# 3. Model Architecture (Showcasing Tied Weights & Embeddings)
-# =============================================================================
-class AxiomLM(Module):
-    def __init__(self, vocab_size: int, dim: int, heads: int, depth: int):
-        self.vocab_size = vocab_size
-        self.dim = dim
-        self.layers = nnx.List([
-            nnx.List([Attention(dim, heads), FeedForward(dim)])
-            for _ in range(depth)
-        ])
-
+class BiasImplicitMod(Module):
     def __call__(self, x):
-        # 1. Efficient Integer Embedding & Weight Tying Extraction
-        # Transforms [b, sq] -> [b, sq, d]
-        x, w_emb = x.embed(vocab=self.vocab_size, out=ax.d(self.dim), return_weight=True)
-
-        # 2. Transformer Blocks (Pre-Norm architecture)
-        for attn, ff in self.layers:
-            x = x + attn(x[..., ax.d.norm_rms()])
-            x = x + ff(x[..., ax.d.norm_rms()])
-
-        # 3. Final Norm and Tied-Weight Readout Projection
-        x = x[..., ax.d.norm_rms()]
-        return x[..., ax.d.proj(out=ax.vocab(self.vocab_size), weight=w_emb)]
+        return x[..., ax.d.bias(init_fn=const_init(2.0))]
 
 
-# =============================================================================
-# 4. Training Engine (Showcasing NNX/Optax Integration)
-# =============================================================================
-def main():
-    print("🚀 Initializing Axiom Quickstart Engine...")
+class GateImplicitMod(Module):
+    def __call__(self, x):
+        return x[..., ax.d.gate(init_fn=const_init(3.0))]
 
-    # Hyperparameters
-    BATCH, SEQ, VOCAB, DIM, HEADS, DEPTH = 8, 64, 256, 128, 4, 2
-    EPOCHS = 25
 
-    # 1. Initialize Model
-    model = AxiomLM(vocab_size=VOCAB, dim=DIM, heads=HEADS, depth=DEPTH)
+class RMSImplicitScaleMod(Module):
+    def __call__(self, x):
+        return x[..., ax.d.norm_rms(init_scale=const_init(2.0))]
 
-    # 2. Generate Dummy Integer Sequence Data (Massive memory savings!)
-    key_x, key_y = jax.random.split(jax.random.key(42))
-    x_ints = jax.random.randint(key_x, (BATCH, SEQ), 0, VOCAB)
-    y_labels = jax.random.randint(key_y, (BATCH, SEQ), 0, VOCAB)
 
-    # 3. Wrap inputs in Axiom Tensors (Rank 2)
-    X = tensor(x_ints, ax.b, ax.sq)
+class DropoutZeroMod(Module):
+    def __call__(self, x):
+        return x[..., ax.d.dropout(0.0)]
 
-    # 4. The Dummy Pass (Triggers Axiom's dynamic memory allocation)
-    _ = model(X)
 
-    # 5. Initialize NNX Optimizer
-    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=1e-3), wrt=nnx.Param)
+class EmbedMod(Module):
+    def __call__(self, x):
+        return x.embed(vocab=5, out=ax.d(3), return_weight=True)
 
-    # Calculate exact parameter count to prove weight tying efficiency
-    params = nnx.state(model, nnx.Param)
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
 
-    # 6. Define Scalar Loss Function
-    def loss_fn(model, x_in, y_out):
-        logits = model(x_in)
-        # Use integer label cross-entropy to match our dense labels
-        return optax.softmax_cross_entropy_with_integer_labels(logits.data, y_out).mean()
+class AxiomRuntimeTests(unittest.TestCase):
+    def test_axiomtensor_is_pytree_and_tree_map_roundtrips(self):
+        x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.d)
+        y = jax.tree_util.tree_map(lambda arr: arr + 1, x)
 
-    print(f"Model successfully compiled. Total Parameters: {param_count:,}")
-    print("Beginning Training Loop...\n")
+        self.assertEqual(type(y), type(x))
+        assert_axes(self, y, ["b", "d"], [None, None])
+        assert_allclose(y.data, x.data + 1)
 
-    # 7. Execute Training
-    for epoch in range(1, EPOCHS + 1):
-        loss, grads = nnx.value_and_grad(loss_fn)(model, X, y_labels)
-        optimizer.update(model, grads)
+    def test_named_transpose_pack_unpack(self):
+        x = tensor(jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4), ax.b, ax.s, ax.d)
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:02d} | Loss: {loss:.4f}")
+        y = x[ax.b, ax.s, ax.d, "->", ax.b, ax.d, ax.s]
+        assert_axes(self, y, ["b", "d", "s"], [2, 4, 3])
+        assert_allclose(y.data, jnp.transpose(x.data, (0, 2, 1)))
 
-    print("\n✅ Quickstart complete! Axiom is ready for deployment.")
+        p = y[ax.b, ax.d, ax.s, "->", ax.b, ax.d & ax.s]
+        assert_axes(self, p, ["b", "d&s"], [2, 12])
+
+        z = p[ax.b, ax.d(4) & ax.s(3), "->", ax.b, ax.d, ax.s]
+        assert_axes(self, z, ["b", "d", "s"], [2, 4, 3])
+        assert_allclose(z.data, y.data)
+
+    def test_ellipsis_route(self):
+        x = tensor(jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4), ax.b, ax.s, ax.d)
+        y = x[..., ax.d, "->", ax.d, ...]
+        assert_axes(self, y, ["d", "b", "s"], [4, 2, 3])
+        assert_allclose(y.data, jnp.transpose(x.data, (2, 0, 1)))
+
+    def test_multiple_arrow_raises(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x[ax.b, "->", ax.d, "->", ax.b]
+
+    def test_multiple_ellipsis_raises(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x[..., ..., ax.d]
+
+    def test_axiomtensor_arithmetic_is_strict_but_raw_arrays_broadcast(self):
+        x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.d)
+        y = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+        z = x + y
+        assert_axes(self, z, ["b", "d"], [None, None])
+        assert_allclose(z.data, x.data + y.data)
+
+        y_bad = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.d, ax.b)
+        with self.assertRaises(AxiomShapeError):
+            _ = x + y_bad
+
+        raw = jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32)
+        z2 = x + raw
+        assert_axes(self, z2, ["b", "d"], [None, None])
+        assert_allclose(z2.data, x.data + raw)
+
+    def test_duplicate_axis_names_rejected_on_projection(self):
+        x = tensor(jnp.ones((2, 4, 8), dtype=jnp.float32), ax.b, ax.sq, ax.d)
+        with self.assertRaises(AxiomShapeError):
+            _ = x[..., ax.d.proj(out=ax.sq(8), use_bias=False)]
+
+    def test_duplicate_axis_names_rejected_on_alias(self):
+        x = tensor(jnp.ones((2, 4, 5), dtype=jnp.float32), ax.b, ax.sq, ax.sk)
+        with self.assertRaises(AxiomShapeError):
+            _ = x[ax.b, (ax.sq >> ax.sk), ax.sk]
+
+    def test_proj_default_use_bias_true(self):
+        x = tensor(jnp.zeros((2, 4), dtype=jnp.float32), ax.b, ax.d)
+        mod = ProjDefaultBiasMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "o"], [2, 3])
+        assert_allclose(y.data, jnp.full((2, 3), 2.0, dtype=jnp.float32))
+
+    def test_proj_use_bias_false(self):
+        x = tensor(jnp.zeros((2, 4), dtype=jnp.float32), ax.b, ax.d)
+        mod = ProjNoBiasMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "o"], [2, 3])
+        assert_allclose(y.data, jnp.zeros((2, 3), dtype=jnp.float32))
+
+    def test_explicit_weighted_proj_with_explicit_bias(self):
+        x = tensor(jnp.array([[1.0, 2.0, 3.0]], dtype=jnp.float32), ax.b, ax.d)
+        w = tensor(
+            jnp.array([
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ], dtype=jnp.float32),
+            ax.d,
+            ax.o,
+        )
+        b = tensor(jnp.array([10.0, 20.0], dtype=jnp.float32), ax.o)
+
+        y = x[..., ax.d.proj(out=ax.o(2), weight=w, bias=b, use_bias=False)]
+
+        expected = jnp.einsum("bd,do->bo", x.data, w.data) + b.data
+        assert_axes(self, y, ["b", "o"], [1, 2])
+        assert_allclose(y.data, expected)
+
+    def test_explicit_weighted_proj_to_packed_axis_raises(self):
+        x = tensor(jnp.ones((2, 8), dtype=jnp.float32), ax.b, ax.d)
+        w = tensor(jnp.ones((8, 2, 4), dtype=jnp.float32), ax.d, ax.h, ax.dh)
+
+        with self.assertRaises(AxiomShapeError):
+            _ = x[..., ax.d.proj(out=ax.h(2) & ax.dh(4), weight=w, use_bias=False)]
+
+    def test_implicit_bias(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+        mod = BiasImplicitMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "d"], [2, 3])
+        assert_allclose(y.data, x.data + 2.0)
+
+    def test_explicit_bias_named_broadcast(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 2, 3), ax.b, ax.s, ax.d)
+        b = tensor(jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32), ax.d)
+
+        y = x[..., ax.d.bias(tensor=b)]
+        expected = x.data + jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "s", "d"], [2, 2, 3])
+        assert_allclose(y.data, expected)
+
+    def test_implicit_gate(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+        mod = GateImplicitMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "d"], [2, 3])
+        assert_allclose(y.data, x.data * 3.0)
+
+    def test_explicit_gate_named_broadcast(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 2, 3), ax.b, ax.s, ax.d)
+        g = tensor(jnp.array([2.0, 3.0, 4.0], dtype=jnp.float32), ax.d)
+
+        y = x[..., ax.d.gate(tensor=g)]
+        expected = x.data * jnp.array([2.0, 3.0, 4.0], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "s", "d"], [2, 2, 3])
+        assert_allclose(y.data, expected)
+
+    def test_mask_tril_uses_left_axis_plane(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(3, 4), ax.sq, ax.sk)
+        y = x[..., ax.sk.mask("tril")]
+
+        row = jnp.arange(3)[:, None]
+        col = jnp.arange(4)[None, :]
+        fill = jnp.finfo(jnp.float32).min
+        expected = jnp.where(row >= col, x.data, fill)
+
+        assert_axes(self, y, ["sq", "sk"], [3, 4])
+        assert_allclose(y.data, expected)
+
+    def test_mask_triu_uses_left_axis_plane(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(3, 4), ax.sq, ax.sk)
+        y = x[..., ax.sk.mask("triu")]
+
+        row = jnp.arange(3)[:, None]
+        col = jnp.arange(4)[None, :]
+        fill = jnp.finfo(jnp.float32).min
+        expected = jnp.where(row <= col, x.data, fill)
+
+        assert_axes(self, y, ["sq", "sk"], [3, 4])
+        assert_allclose(y.data, expected)
+
+    def test_alias_visible_name_explicit_bias_works(self):
+        x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.sq)
+        b = tensor(jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32), ax.sk)
+
+        y = x[ax.b, (ax.sq >> ax.sk).bias(tensor=b)]
+
+        assert_axes(self, y, ["b", "sk"], [2, 3])
+        assert_allclose(y.data, x.data + jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32))
+
+    def test_alias_visible_name_reduction_works(self):
+        x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.sq)
+        y = x[ax.b, (ax.sq >> ax.sk).sum()]
+
+        assert_axes(self, y, ["b"], [2])
+        assert_allclose(y.data, jnp.sum(x.data, axis=1))
+
+    def test_norm_rms_implicit_scale(self):
+        x = tensor(jnp.array([[1.0, 2.0, 3.0]], dtype=jnp.float32), ax.b, ax.d)
+        mod = RMSImplicitScaleMod()
+        y = mod(x)
+
+        rms = jnp.sqrt(jnp.mean(x.data ** 2, axis=-1, keepdims=True) + 1e-5)
+        expected = 2.0 * (x.data / rms)
+
+        assert_axes(self, y, ["b", "d"], [1, 3])
+        assert_allclose(y.data, expected, atol=1e-4, rtol=1e-4)
+
+    def test_norm_rms_explicit_scale(self):
+        x = tensor(jnp.array([[1.0, 2.0, 3.0]], dtype=jnp.float32), ax.b, ax.d)
+        scale = tensor(jnp.array([1.0, 2.0, 4.0], dtype=jnp.float32), ax.d)
+
+        y = x[..., ax.d.norm_rms(scale=scale)]
+
+        rms = jnp.sqrt(jnp.mean(x.data ** 2, axis=-1, keepdims=True) + 1e-5)
+        expected = (x.data / rms) * jnp.array([1.0, 2.0, 4.0], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "d"], [1, 3])
+        assert_allclose(y.data, expected, atol=1e-4, rtol=1e-4)
+
+    def test_norm_layer_explicit_scale_and_bias(self):
+        x = tensor(jnp.array([[1.0, 2.0, 4.0]], dtype=jnp.float32), ax.b, ax.d)
+        scale = tensor(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32), ax.d)
+        bias = tensor(jnp.array([10.0, 20.0, 30.0], dtype=jnp.float32), ax.d)
+
+        y = x[..., ax.d.norm_layer(scale=scale, bias=bias, use_scale=False, use_bias=False)]
+
+        mean = jnp.mean(x.data, axis=-1, keepdims=True)
+        var = jnp.var(x.data, axis=-1, keepdims=True)
+        normed = (x.data - mean) / jnp.sqrt(var + 1e-5)
+        expected = normed * scale.data + bias.data
+
+        assert_axes(self, y, ["b", "d"], [1, 3])
+        assert_allclose(y.data, expected, atol=1e-4, rtol=1e-4)
+
+    def test_activations(self):
+        x = tensor(jnp.array([-1.0, 0.0, 1.0], dtype=jnp.float32), ax.d)
+
+        cases = [
+            ("relu", jax.nn.relu(x.data)),
+            ("silu", jax.nn.silu(x.data)),
+            ("gelu", jax.nn.gelu(x.data)),
+            ("sigmoid", jax.nn.sigmoid(x.data)),
+            ("tanh", jnp.tanh(x.data)),
+            ("softmax", jax.nn.softmax(x.data, axis=-1)),
+        ]
+
+        for op_name, expected in cases:
+            with self.subTest(op_name=op_name):
+                token = getattr(ax.d, op_name)()
+                y = x[token]
+                assert_axes(self, y, ["d"], [3])
+                assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_cast(self):
+        x = tensor(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32), ax.d)
+        y = x[ax.d.cast(jnp.bfloat16)]
+
+        assert_axes(self, y, ["d"], [3])
+        self.assertEqual(y.data.dtype, jnp.bfloat16)
+
+    def test_dropout_rate_zero_is_noop(self):
+        x = tensor(jnp.arange(6, dtype=jnp.float32).reshape(2, 3), ax.b, ax.d)
+        mod = DropoutZeroMod()
+        y = mod(x)
+
+        assert_axes(self, y, ["b", "d"], [2, 3])
+        assert_allclose(y.data, x.data)
+
+    def test_scan_simple_cumsum(self):
+        def step(carry, xs):
+            x_t = xs[0]
+            new = carry + x_t
+            return new, new
+
+        x = tensor(jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32), ax.s)
+        y = x[ax.s.scan(step)]
+
+        expected = jnp.cumsum(x.data, axis=0)
+        assert_axes(self, y, ["s"], [4])
+        assert_allclose(y.data, expected)
+
+    def test_scan_with_extra_input(self):
+        def step(carry, xs):
+            x_t, u_t = xs
+            new = carry + x_t + u_t
+            return new, new
+
+        x = tensor(jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32), ax.s)
+        u = tensor(jnp.array([10.0, 20.0, 30.0, 40.0], dtype=jnp.float32), ax.s)
+
+        y = x[ax.s.scan(step, inputs=(u,))]
+        expected = jnp.cumsum(x.data + u.data, axis=0)
+
+        assert_axes(self, y, ["s"], [4])
+        assert_allclose(y.data, expected)
+
+    def test_explicit_conv_1d_kernel_and_bias(self):
+        x = tensor(jnp.arange(4, dtype=jnp.float32).reshape(1, 4, 1), ax.b, ax.s, ax.c)
+        w = jnp.ones((1, 1, 1), dtype=jnp.float32)
+        b = tensor(jnp.array([2.0], dtype=jnp.float32), ax.cout)
+
+        y = x[..., ax.c.conv(
+            features=ax.cout(1),
+            kernel_size=(1,),
+            weight=w,
+            bias=b,
+            use_bias=False,
+        )]
+
+        expected = x.data + 2.0
+        assert_axes(self, y, ["b", "s", "cout"], [1, 4, 1])
+        assert_allclose(y.data, expected)
+
+    def test_embed_implicit_then_explicit_weight_reuse(self):
+        x_ids = tensor(jnp.array([[0, 1, 2], [2, 3, 4]], dtype=jnp.int32), ax.b, ax.sq)
+
+        mod = EmbedMod()
+        y1, w = mod(x_ids)
+        y2 = x_ids.embed(weight=w)
+
+        assert_axes(self, y1, ["b", "sq", "d"], [None, None, 3])
+        assert_axes(self, w, ["vocab", "d"], [5, 3])
+        assert_axes(self, y2, ["b", "sq", "d"], [None, None, 3])
+
+        assert_allclose(y2.data, y1.data)
+
+    def test_implicit_ops_require_module(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.d)
+
+        cases = [
+            lambda t: t[..., ax.d.bias()],
+            lambda t: t[..., ax.d.gate()],
+            lambda t: t[..., ax.d.norm_rms()],
+            lambda t: t[..., ax.d.proj(out=ax.o(2))],
+            lambda t: t[..., ax.d.dropout(0.0)],
+        ]
+
+        for fn in cases:
+            with self.subTest(fn=fn):
+                with self.assertRaises(RuntimeError):
+                    _ = fn(x)
+
+    def test_implicit_conv_requires_module(self):
+        x = tensor(jnp.ones((1, 4, 1), dtype=jnp.float32), ax.b, ax.s, ax.c)
+        with self.assertRaises(RuntimeError):
+            _ = x[..., ax.c.conv(features=ax.cout(1), kernel_size=(1,))]
+
+    def test_implicit_embed_requires_module(self):
+        x_ids = tensor(jnp.array([[0, 1, 2]], dtype=jnp.int32), ax.b, ax.sq)
+        with self.assertRaises(RuntimeError):
+            _ = x_ids.embed(vocab=5, out=ax.d(3))
+
+    def test_ambiguity_checks(self):
+        b = tensor(jnp.array([1.0, 2.0], dtype=jnp.float32), ax.o)
+        with self.assertRaises(ValueError):
+            _ = ax.d.proj(out=ax.o(2), bias=b, use_bias=True)
+
+        b2 = tensor(jnp.array([1.0], dtype=jnp.float32), ax.cout)
+        with self.assertRaises(ValueError):
+            _ = ax.c.conv(features=ax.cout(1), kernel_size=(1,), bias=b2, use_bias=True)
+
+        s = tensor(jnp.array([1.0, 2.0], dtype=jnp.float32), ax.d)
+        with self.assertRaises(ValueError):
+            _ = ax.d.norm_layer(scale=s, use_scale=True)
+
+        b3 = tensor(jnp.array([1.0, 2.0], dtype=jnp.float32), ax.d)
+        with self.assertRaises(ValueError):
+            _ = ax.d.norm_layer(bias=b3, use_bias=True)
+
+    def test_packing_restrictions(self):
+        with self.assertRaises(ValueError):
+            _ = ax.h.relu() & ax.dh
+
+        p = (ax.h & ax.dh).norm_rms()
+        with self.assertRaises(ValueError):
+            _ = p & ax.x
+
+    def test_reductions(self):
+        x = tensor(jnp.array([[1.0, 2.0, 4.0], [3.0, 5.0, 7.0]], dtype=jnp.float32), ax.b, ax.d)
+
+        cases = [
+            ("sum", jnp.sum(x.data, axis=1)),
+            ("mean", jnp.mean(x.data, axis=1)),
+            ("max", jnp.max(x.data, axis=1)),
+            ("min", jnp.min(x.data, axis=1)),
+            ("var", jnp.var(x.data, axis=1)),
+            ("std", jnp.std(x.data, axis=1)),
+        ]
+
+        for reduction, expected in cases:
+            with self.subTest(reduction=reduction):
+                token = getattr(ax.d, reduction)()
+                y = x[ax.b, token]
+                assert_axes(self, y, ["b"], [2])
+                assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_packed_lhs_gate_survives_and_can_unpack_on_rhs(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 6), ax.b, ax.flat(6))
+
+        y = x[
+            ax.b,
+            (ax.flat >> (ax.h(2) & ax.dh(3))).gate(tensor=2.0),
+            "->",
+            ax.b,
+            ax.h,
+            ax.dh,
+        ]
+
+        expected = (x.data * 2.0).reshape(2, 2, 3)
+        assert_axes(self, y, ["b", "h", "dh"], [2, 2, 3])
+        assert_allclose(y.data, expected)
+
+    def test_packed_lhs_norm_survives_and_can_unpack_on_rhs(self):
+        x = tensor(jnp.arange(12, dtype=jnp.float32).reshape(2, 6) + 1.0, ax.b, ax.flat(6))
+
+        y = x[
+            ax.b,
+            (ax.flat >> (ax.h(2) & ax.dh(3))).norm_rms(scale=1.0),
+            "->",
+            ax.b,
+            ax.h,
+            ax.dh,
+        ]
+
+        flat = x.data
+        rms = jnp.sqrt(jnp.mean(flat ** 2, axis=-1, keepdims=True) + 1e-5)
+        expected = (flat / rms).reshape(2, 2, 3)
+
+        assert_axes(self, y, ["b", "h", "dh"], [2, 2, 3])
+        assert_allclose(y.data, expected, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)

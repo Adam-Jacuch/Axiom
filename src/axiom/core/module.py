@@ -1,3 +1,4 @@
+import functools
 import threading
 from flax import nnx
 
@@ -8,7 +9,7 @@ class _ModuleContext:
 
     @property
     def stack(self):
-        if not hasattr(self._local, 'stack'):
+        if not hasattr(self._local, "stack"):
             self._local.stack = []
         return self._local.stack
 
@@ -24,17 +25,21 @@ class Module(nnx.Module):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if '__call__' in cls.__dict__:
-            original_call = cls.__dict__['__call__']
+        if "__call__" in cls.__dict__:
+            original_call = cls.__dict__["__call__"]
 
+            @functools.wraps(original_call)
             def wrapped_call(self, *args, **kwds):
                 context.stack.append(self)
                 self._axiom_param_counter = 0
                 try:
                     result = original_call(self, *args, **kwds)
-                finally:
+                except Exception:
+                    raise
+                else:
                     self._axiom_initialized = True
+                    return result
+                finally:
                     context.stack.pop()
-                return result
 
             cls.__call__ = wrapped_call
