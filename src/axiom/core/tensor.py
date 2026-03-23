@@ -136,11 +136,21 @@ class AxiomTensor:
             out_tensor = AxiomTensor(new_data, (*self.axes, out_axis))
             return (out_tensor, weight) if return_weight else out_tensor
 
+        # --- Implicit Embedding Logic ---
         active_mod = context.get_active()
         if active_mod is None:
             raise RuntimeError("Implicit .embed() must be called inside an axiom.Module.")
-        if vocab is None or out is None:
-            raise ValueError("Implicit .embed() requires both vocab=... and out=....")
+
+        if isinstance(vocab, Axis):
+            vocab_name = vocab.name
+            vocab_size = vocab.size
+        else:
+            # Fallback if someone just passes vocab=256
+            vocab_name = "vocab"
+            vocab_size = vocab
+
+        if vocab_size is None or out is None:
+            raise ValueError("Implicit .embed() requires both a sized vocab axis and an out axis.")
         if out.size is None:
             raise ValueError("Embedding requires an explicit output size, e.g. ax.d(128).")
 
@@ -153,7 +163,7 @@ class AxiomTensor:
                 active_mod,
                 param_name,
                 nnx.Embed(
-                    num_embeddings=vocab,
+                    num_embeddings=vocab_size,
                     features=out.size,
                     dtype=e_dtype,
                     param_dtype=e_dtype,
@@ -168,7 +178,7 @@ class AxiomTensor:
 
         if return_weight:
             w_data = embed_layer.embedding.get_value()
-            w_tensor = AxiomTensor(w_data, (Axis("vocab", vocab), Axis(out.name, out.size)))
+            w_tensor = AxiomTensor(w_data, (Axis(vocab_name, vocab_size), Axis(out.name, out.size)))
             return out_tensor, w_tensor
 
         return out_tensor
