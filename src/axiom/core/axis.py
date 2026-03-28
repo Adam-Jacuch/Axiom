@@ -16,8 +16,18 @@ class SymbolicSize:
             )
         ref_size = size_map[self.ref_name]
 
-        if self.op == "*": return ref_size * self.value
-        if self.op == "//": return ref_size // self.value
+        if self.op == "*":
+            return ref_size * self.value
+
+        if self.op == "//":
+            # The new runtime divisibility guardrail
+            if ref_size % self.value != 0:
+                raise AxiomShapeError(
+                    f"Symbolic floor division failed at runtime: axis '{self.ref_name}' "
+                    f"size {ref_size} is not cleanly divisible by {self.value}."
+                )
+            return ref_size // self.value
+
         raise ValueError(f"Unknown symbolic op: {self.op}")
 
     def __repr__(self):
@@ -25,16 +35,17 @@ class SymbolicSize:
 
 
 class ConsumedSlot:
-    def __init__(self, source_name: str, op: str):
-        self.source_name = source_name
+    def __init__(self, name: str, op: str, source_name: str = None):
+        self._name = name
         self.op = op
+        self.source_name = source_name if source_name is not None else name
 
     @property
     def name(self):
-        return self.source_name
+        return self._name
 
     def __repr__(self):
-        return f"ConsumedSlot('{self.source_name}', op='{self.op}')"
+        return f"ConsumedSlot('{self._name}', op='{self.op}')"
 
 
 class CastOp:
@@ -178,12 +189,44 @@ class DropoutOp:
 
 
 class ScanOp:
-    def __init__(self, fn, inputs):
+    def __init__(self, fn, inputs, init=None):
         self.fn = fn
         self.inputs = inputs
+        self.init = init
+
+
+class WhereOp:
+    def __init__(self, condition, false_tensor):
+        self.condition = condition
+        self.false_tensor = false_tensor
+
+class PadOp:
+    def __init__(self, pad_width, mode="constant", value=0.0):
+        self.pad_width = tuple(pad_width)
+        self.mode = mode
+        self.value = value
+
+class GatherOp:
+    def __init__(self, indices):
+        self.indices = indices
+
+class RollOp:
+    def __init__(self, shift):
+        self.shift = shift
+
+class FillOp:
+    def __init__(self, value):
+        self.value = value
+
+class AttendOp:
+    def __init__(self, keys, values, dim, is_causal=False):
+        self.keys = keys
+        self.values = values
+        self.dim = dim
+        self.is_causal = is_causal
 
     def __repr__(self):
-        return f"ScanOp(fn={self.fn.__name__})"
+        return f"AttendOp(causal={self.is_causal})"
 
 
 def _validate_pack_child(axis):
@@ -334,6 +377,24 @@ class PackedAxis:
                 )
             ]
         )
+
+    def where(self, condition, false_tensor):
+        return self._spawn(list(self.ops) + [WhereOp(condition, false_tensor)])  # Use self.__class__(...) for Axis
+
+    def pad(self, pad_width, mode="constant", value=0.0):
+        return self._spawn(list(self.ops) + [PadOp(pad_width, mode, value)])
+
+    def gather(self, indices):
+        return self._spawn(list(self.ops) + [GatherOp(indices)])
+
+    def roll(self, shift):
+        return self._spawn(list(self.ops) + [RollOp(shift)])
+
+    def fill(self, value):
+        return self._spawn(list(self.ops) + [FillOp(value)])
+
+    def scan(self, fn, inputs=None, init=None):
+        return self._spawn(list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple(), init=init)])
 
     def dropout(self, rate=0.1):
         return self._spawn(list(self.ops) + [DropoutOp(rate)])
@@ -550,6 +611,46 @@ class Axis:
             self.source_name,
         )
 
+    def where(self, condition, false_tensor):
+        return Axis(
+            self.name, self.size, list(self.ops) + [WhereOp(condition, false_tensor)], self.source_name
+        )
+
+    def pad(self, pad_width, mode="constant", value=0.0):
+        return Axis(
+            self.name, self.size, list(self.ops) + [PadOp(pad_width, mode, value)], self.source_name
+        )
+
+    def gather(self, indices):
+        return Axis(
+            self.name, self.size, list(self.ops) + [GatherOp(indices)], self.source_name
+        )
+
+    def roll(self, shift):
+        return Axis(
+            self.name, self.size, list(self.ops) + [RollOp(shift)], self.source_name
+        )
+
+    def fill(self, value):
+        return Axis(
+            self.name, self.size, list(self.ops) + [FillOp(value)], self.source_name
+        )
+
+    def scan(self, fn, inputs=None, init=None):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple(), init=init)],
+            self.source_name
+        )
+
+    def attend(self, keys, values, dim, is_causal=False):
+        return Axis(
+            self.name, self.size,
+            list(self.ops) + [AttendOp(keys, values, dim, is_causal)],
+            self.source_name
+        )
+
     def dropout(self, rate=0.1):
         return Axis(self.name, self.size, list(self.ops) + [DropoutOp(rate)], self.source_name)
 
@@ -584,22 +685,22 @@ class Axis:
         return Axis(self.name, self.size, list(self.ops) + ["softmax"], self.source_name)
 
     def sum(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "sum")
+        return ConsumedSlot(self.name, "sum", source_name=getattr(self, "source_name", self.name))
 
     def mean(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "mean")
+        return ConsumedSlot(self.name, "mean", source_name=getattr(self, "source_name", self.name))
 
     def max(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "max")
+        return ConsumedSlot(self.name, "max", source_name=getattr(self, "source_name", self.name))
 
     def min(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "min")
+        return ConsumedSlot(self.name, "min", source_name=getattr(self, "source_name", self.name))
 
     def var(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "var")
+        return ConsumedSlot(self.name, "var", source_name=getattr(self, "source_name", self.name))
 
     def std(self) -> ConsumedSlot:
-        return ConsumedSlot(self.name, "std")
+        return ConsumedSlot(self.name, "std", source_name=getattr(self, "source_name", self.name))
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"

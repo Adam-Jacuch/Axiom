@@ -593,6 +593,81 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_axes(self, y, ["b", "h", "dh"], [2, 2, 3])
         assert_allclose(y.data, expected, atol=1e-4, rtol=1e-4)
 
+    # -------------------------------------------------------------------------
+    # Axiom v2 Structural Operations
+    # -------------------------------------------------------------------------
+
+    def test_where_op(self):
+        x = tensor(jnp.array([[1.0, 2.0], [3.0, 4.0]], dtype=jnp.float32), ax.b, ax.s)
+        mask = tensor(jnp.array([[True, False], [False, True]]), ax.b, ax.s)
+        zeros = tensor(jnp.zeros((2, 2), dtype=jnp.float32), ax.b, ax.s)
+
+        y = x[..., ax.s.where(condition=mask, false_tensor=zeros)]
+
+        expected = jnp.array([[1.0, 0.0], [0.0, 4.0]], dtype=jnp.float32)
+        assert_axes(self, y, ["b", "s"], [2, 2])
+        assert_allclose(y.data, expected)
+
+    def test_pad_op(self):
+        x = tensor(jnp.ones((2, 3), dtype=jnp.float32), ax.b, ax.s)
+        # Pad the sequence dimension by 1 on the left, 2 on the right
+        y = x[..., ax.s.pad((1, 2), mode="constant", value=0.0)]
+
+        expected = jnp.array([
+            [0.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+        ], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "s"], [2, 6])
+        assert_allclose(y.data, expected)
+
+    def test_gather_op_moe_routing(self):
+        # 3 experts, each with a hidden size of 4
+        experts = tensor(jnp.arange(12, dtype=jnp.float32).reshape(3, 4), ax.e(3), ax.d(4))
+        # Batch of 2 tokens, routed to expert 2 and expert 0
+        routing_idx = tensor(jnp.array([2, 0], dtype=jnp.int32), ax.b(2))
+
+        # Gather along the expert dimension
+        routed = experts[ax.e.gather(routing_idx), ax.d]
+
+        expected = jnp.array([
+            [8.0, 9.0, 10.0, 11.0],  # Expert 2
+            [0.0, 1.0, 2.0, 3.0]  # Expert 0
+        ], dtype=jnp.float32)
+
+        assert_axes(self, routed, ["b", "d"], [2, 4])
+        assert_allclose(routed.data, expected)
+
+    def test_roll_op_rope_shift(self):
+        x = tensor(jnp.arange(4, dtype=jnp.float32), ax.d)
+        y = x[ax.d.roll(shift=1)]
+
+        expected = jnp.array([3.0, 0.0, 1.0, 2.0], dtype=jnp.float32)
+        assert_axes(self, y, ["d"], [4])
+        assert_allclose(y.data, expected)
+
+    def test_fill_op(self):
+        x = tensor(jnp.arange(4, dtype=jnp.float32), ax.d)
+        y = x[ax.d.fill(-1.0)]
+
+        expected = jnp.full((4,), -1.0, dtype=jnp.float32)
+        assert_axes(self, y, ["d"], [4])
+        assert_allclose(y.data, expected)
+
+    def test_flash_attention_routing(self):
+        # [batch, heads, seq, head_dim]
+        q = tensor(jnp.ones((2, 4, 8, 16), dtype=jnp.float32), ax.b, ax.h, ax.sq, ax.dh)
+
+        # Notice we changed sq to sk for keys and values
+        k = tensor(jnp.ones((2, 4, 8, 16), dtype=jnp.float32), ax.b, ax.h, ax.sk, ax.dh)
+        v = tensor(jnp.ones((2, 4, 8, 16), dtype=jnp.float32), ax.b, ax.h, ax.sk, ax.dh)
+
+        # FIXED: explicitly list ax.dh at the end so it matches the physical layout [b, h, sq, dh]!
+        ctx = q[..., ax.sq.attend(keys=k, values=v, dim=ax.dh, is_causal=True), ax.dh]
+
+        assert_axes(self, ctx, ["b", "h", "sq", "dh"], [2, 4, 8, 16])
+        self.assertEqual(ctx.data.shape, (2, 4, 8, 16))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

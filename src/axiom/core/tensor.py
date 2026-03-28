@@ -20,6 +20,12 @@ from .axis import (
     ProjOp,
     ScanOp,
     SymbolicSize,
+    WhereOp,
+    PadOp,
+    GatherOp,
+    RollOp,
+    FillOp,
+    AttendOp,
 )
 from .module import context
 from .. import init as a_init
@@ -782,6 +788,50 @@ class AxiomTensor:
             elif op == "softmax":
                 current_data = jax.nn.softmax(current_data, axis=idx)
 
+            elif isinstance(op, WhereOp):
+                cond_data = self._align_explicit_operand(
+                    op.condition, current_axis_names, current_data.shape, axis_idx=None, op_name="where condition"
+                )
+                false_data = self._align_explicit_operand(
+                    op.false_tensor, current_axis_names, current_data.shape, axis_idx=None, op_name="where false_tensor"
+                )
+                current_data = jnp.where(cond_data, current_data, false_data)
+
+            elif isinstance(op, FillOp):
+                # Modernized to idiomatic JAX
+                current_data = jnp.full_like(current_data, op.value)
+
+            elif isinstance(op, RollOp):
+                shift = op.shift.data if hasattr(op.shift, "data") else op.shift
+                current_data = jnp.roll(current_data, shift, axis=idx)
+
+            elif isinstance(op, PadOp):
+                pad_config = [(0, 0)] * current_data.ndim
+                pad_config[idx] = op.pad_width
+                current_data = jnp.pad(current_data, pad_config, mode=op.mode, constant_values=op.value)
+                # Materialize the new padded size
+                current_token = Axis(current_token.name, int(current_data.shape[idx]),
+                                     source_name=current_token.source_name)
+
+            elif isinstance(op, GatherOp):
+                indices_data = op.indices.data
+
+                # 1. Perform standard JAX take
+                current_data = jnp.take(current_data, indices_data, axis=idx)
+
+                # 2. Rank has increased! Flatten the newly inserted dimensions temporarily.
+                # This ensures the LHS router loop still treats this operation as returning a single token.
+                flattened_dim_size = math.prod(indices_data.shape)
+                new_shape = list(current_data.shape)
+                new_shape = new_shape[:idx] + [flattened_dim_size] + new_shape[idx + indices_data.ndim:]
+                current_data = jnp.reshape(current_data, new_shape)
+
+                # 3. Construct a PackedAxis representing the newly gathered dimensions
+                new_axes = op.indices.axes
+                packed_name = "&".join(a.name for a in new_axes)
+                current_axis_names[idx] = packed_name
+                current_token = PackedAxis(*new_axes)
+
             elif isinstance(op, CastOp):
                 current_data = current_data.astype(op.dtype)
 
@@ -880,23 +930,135 @@ class AxiomTensor:
                 drop_layer = getattr(active_mod, param_name)
                 current_data = drop_layer(current_data)
 
+
             elif isinstance(op, ScanOp):
+
                 scan_main = jnp.swapaxes(current_data, 0, idx)
+
                 scan_extras = []
+
                 for extra in op.inputs:
                     extra_names = [a.name for a in extra.axes]
+
                     e_idx = extra_names.index(current_token.name)
+
                     scan_extras.append(jnp.swapaxes(extra.data, 0, e_idx))
 
-                init_state = jnp.zeros_like(scan_main[0])
+                # Handle the explicit initialization state
+
+                if op.init is not None:
+
+                    init_state = op.init.data if hasattr(op.init, "data") else op.init
+
+                else:
+
+                    init_state = jnp.zeros_like(scan_main[0])
 
                 def scan_body(carry, xs):
+
                     new_state, out_y = op.fn(carry, (xs[0], *xs[1:]))
+
                     new_state = new_state.astype(carry.dtype)
+
                     return new_state, out_y
 
                 _, scanned_out = jax.lax.scan(scan_body, init_state, (scan_main, *scan_extras))
+
                 current_data = jnp.swapaxes(scanned_out, 0, idx)
+
+
+
+            elif isinstance(op, AttendOp):
+
+                q_seq_name = current_axis_names[idx]
+
+                dim_name = op.dim.name if hasattr(op.dim, "name") else str(op.dim)
+
+                if dim_name not in current_axis_names:
+                    raise AxiomShapeError(f".attend() requires feature dimension '{dim_name}' in the query tensor.")
+
+                # 1. Identify query layout
+
+                batch_names = [n for n in current_axis_names if n not in (q_seq_name, dim_name)]
+
+                q_target_layout = batch_names + [q_seq_name, dim_name]
+
+                q_perm = [current_axis_names.index(n) for n in q_target_layout]
+
+                q_aligned = jnp.transpose(current_data, q_perm)
+
+                # Flatten batch & head names into a single dimension, and insert num_heads=1
+
+                # Shape becomes: (batch_flat, seq_len, 1, dim_size)
+
+                batch_size_flat = math.prod(q_aligned.shape[:-2]) if batch_names else 1
+
+                q_seq_len = q_aligned.shape[-2]
+
+                dim_size = q_aligned.shape[-1]
+
+                q_reshaped = jnp.reshape(q_aligned, (batch_size_flat, q_seq_len, 1, dim_size))
+
+                # 2. Identify keys/values layout
+
+                if not isinstance(op.keys, AxiomTensor) or not isinstance(op.values, AxiomTensor):
+                    raise TypeError(".attend() requires explicit keys and values to be AxiomTensors.")
+
+                k_names = [a.name for a in op.keys.axes]
+
+                v_names = [a.name for a in op.values.axes]
+
+                kv_seq_candidates = [n for n in k_names if n not in batch_names and n != dim_name]
+
+                if len(kv_seq_candidates) != 1:
+                    raise AxiomShapeError(
+
+                        f"Could not automatically infer the kv-sequence axis. "
+
+                        f"Keys: {k_names}, Batch: {batch_names}, Feature: {dim_name}"
+
+                    )
+
+                kv_seq_name = kv_seq_candidates[0]
+
+                kv_target_layout = batch_names + [kv_seq_name, dim_name]
+
+                if set(k_names) != set(kv_target_layout):
+                    raise AxiomShapeError(f"Keys tensor must have exactly axes {kv_target_layout}. Got {k_names}.")
+
+                if set(v_names) != set(kv_target_layout):
+                    raise AxiomShapeError(f"Values tensor must have exactly axes {kv_target_layout}. Got {v_names}.")
+
+                k_aligned = jnp.transpose(op.keys.data, [k_names.index(n) for n in kv_target_layout])
+
+                kv_seq_len = k_aligned.shape[-2]
+
+                k_reshaped = jnp.reshape(k_aligned, (batch_size_flat, kv_seq_len, 1, dim_size))
+
+                v_aligned = jnp.transpose(op.values.data, [v_names.index(n) for n in kv_target_layout])
+
+                v_reshaped = jnp.reshape(v_aligned, (batch_size_flat, kv_seq_len, 1, dim_size))
+
+                # 3. Create boolean causal mask if requested
+
+                mask = None
+
+                if op.is_causal:
+                    mask = jnp.arange(q_seq_len)[:, None] >= jnp.arange(kv_seq_len)[None, :]
+
+                # 4. Execute FlashAttention Backend
+
+                # JAX dot_product_attention now gets the exact 4D shape it strictly requires
+
+                attended = jax.nn.dot_product_attention(q_reshaped, k_reshaped, v_reshaped, mask=mask)
+
+                # 5. Restore user's original logical layout
+
+                attended_unflattened = jnp.reshape(attended, q_aligned.shape)
+
+                restore_perm = [q_target_layout.index(n) for n in current_axis_names]
+
+                current_data = jnp.transpose(attended_unflattened, restore_perm)
 
             elif isinstance(op, ProjOp):
                 # Dynamically resolve any symbolic output sizes right before executing
@@ -1100,6 +1262,15 @@ class AxiomTensor:
         flat_lhs_tokens = []
 
         for i, (ax_def, token) in enumerate(zip(self.axes, lhs_resolved)):
+            # The Ultimate Guardrail: LHS must exactly match physical layout
+            token_name = getattr(token, "source_name", getattr(token, "name", str(token)))
+            if token_name != ax_def.name:
+                raise AxiomShapeError(
+                    f"LHS axis mismatch at index {i}: expected physical axis '{ax_def.name}', "
+                    f"but got '{token_name}'. The LHS must exactly describe the current physical layout. "
+                    f"Use '->' for routing or reordering."
+                )
+
             if isinstance(token, PackedAxis):
                 token_name = getattr(token, "source_name", token.name)
                 if token_name != ax_def.name:
