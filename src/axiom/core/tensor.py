@@ -4,28 +4,14 @@ from typing import Any, List, Tuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 from flax import nnx
 
 from .axis import (
-    Axis,
-    BiasOp,
-    CastOp,
-    ConsumedSlot,
-    ConvOp,
-    DropoutOp,
-    GateOp,
-    MaskOp,
-    NormOp,
-    PackedAxis,
-    ProjOp,
-    ScanOp,
-    SymbolicSize,
-    WhereOp,
-    PadOp,
-    GatherOp,
-    RollOp,
-    FillOp,
-    AttendOp,
+    Axis, BiasOp, CastOp, ConsumedSlot, ConvOp, DropoutOp, GateOp, MaskOp,
+    NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
+    RollOp, FillOp, AttendOp,
+    ClampOp, StopGradientOp, ScatterOp
 )
 from .module import context
 from .. import init as a_init
@@ -402,6 +388,78 @@ class AxiomTensor:
             else:
                 resolved.append(t)
         return resolved
+
+    # -------------------------------------------------------------------------
+    # Structural Methods (Phase 3 additions)
+    # -------------------------------------------------------------------------
+
+    def _axis_index(self, axis_name: str) -> int:
+        for i, a in enumerate(self.axes):
+            if a.name == axis_name:
+                return i
+        raise AxiomShapeError(f"Axis '{axis_name}' not found in tensor.")
+
+    def split(self, axis: Axis, num_chunks: int) -> Tuple["AxiomTensor", ...]:
+        """Splits the tensor into distinct physical AxiomTensors along the specified axis."""
+        idx = self._axis_index(axis.name)
+        chunks = jnp.split(self.data, num_chunks, axis=idx)
+
+        results = []
+        for c in chunks:
+            new_axes = tuple(
+                Axis(a.name, int(c.shape[i]), source_name=getattr(a, "source_name", a.name))
+                for i, a in enumerate(self.axes)
+            )
+            results.append(AxiomTensor(c, new_axes))
+
+        return tuple(results)
+
+    @classmethod
+    def concat(cls, tensors: List["AxiomTensor"], axis: Axis) -> "AxiomTensor":
+        """Concatenates multiple AxiomTensors along the specified axis."""
+        if not tensors:
+            raise ValueError("Must provide at least one tensor to concat.")
+        if len(tensors) == 1:
+            return tensors[0]
+
+        ref_axes = [a.name for a in tensors[0].axes]
+        if axis.name not in ref_axes:
+            raise AxiomShapeError(f"Concat axis '{axis.name}' not found in reference tensor.")
+
+        idx = ref_axes.index(axis.name)
+        data_list = []
+        for t in tensors:
+            names = [a.name for a in t.axes]
+            if names != ref_axes:
+                raise AxiomShapeError(f"Cannot concat tensors with mismatched axes: {names} vs {ref_axes}")
+            data_list.append(t.data)
+
+        new_data = jnp.concatenate(data_list, axis=idx)
+
+        # Materialize sizes for all axes based on the new concatenated shape
+        new_axes = tuple(
+            Axis(a.name, int(new_data.shape[i]), source_name=getattr(a, "source_name", a.name))
+            for i, a in enumerate(tensors[0].axes)
+        )
+        return cls(new_data, new_axes)
+
+    def topk(self, axis: Axis, k: int) -> Tuple["AxiomTensor", "AxiomTensor"]:
+        """Returns the top K values and indices along a specific axis."""
+        idx = self._axis_index(axis.name)
+        moved = jnp.moveaxis(self.data, idx, -1)
+
+        values, indices = jax.lax.top_k(moved, k)
+
+        values = jnp.moveaxis(values, -1, idx)
+        indices = jnp.moveaxis(indices, -1, idx)
+
+        # Materialize sizes for all axes
+        new_axes = tuple(
+            Axis(a.name, int(values.shape[i]), source_name=getattr(a, "source_name", a.name))
+            for i, a in enumerate(self.axes)
+        )
+
+        return AxiomTensor(values, new_axes), AxiomTensor(indices, new_axes)
 
     # -------------------------------------------------------------------------
     # Param helpers
@@ -787,6 +845,43 @@ class AxiomTensor:
 
             elif op == "softmax":
                 current_data = jax.nn.softmax(current_data, axis=idx)
+
+            # --- Phase 1: Pointwise ---
+            elif op == "exp":
+                current_data = jnp.exp(current_data)
+            elif op == "log":
+                current_data = jnp.log(current_data)
+            elif op == "abs":
+                current_data = jnp.abs(current_data)
+            elif op == "rsqrt":
+                current_data = jax.lax.rsqrt(current_data)
+            elif op == "swiglu":
+                # Splitting automatically halves the axis size, the _materialize_token_size
+                # function at the end of the loop will catch the new size perfectly.
+                chunk1, chunk2 = jnp.split(current_data, 2, axis=idx)
+                current_data = jax.nn.silu(chunk1) * chunk2
+
+
+            elif isinstance(op, ClampOp):
+                # Updated to use JAX's modern 'min' and 'max' kwargs
+                current_data = jnp.clip(current_data, min=op.min_val, max=op.max_val)
+
+            # --- Phase 3: Control & Scatter ---
+            elif isinstance(op, StopGradientOp):
+                current_data = jax.lax.stop_gradient(current_data)
+
+            elif isinstance(op, ScatterOp):
+                indices_data = op.indices.data if hasattr(op.indices, "data") else op.indices
+                updates_data = op.updates.data if hasattr(op.updates, "data") else op.updates
+
+                # Build n-dimensional slice tuple to target the specific axis
+                slices = [slice(None)] * current_data.ndim
+                slices[idx] = indices_data
+
+                if op.mode == "add":
+                    current_data = current_data.at[tuple(slices)].add(updates_data)
+                else:
+                    current_data = current_data.at[tuple(slices)].set(updates_data)
 
             elif isinstance(op, WhereOp):
                 cond_data = self._align_explicit_operand(
@@ -1311,6 +1406,7 @@ class AxiomTensor:
 
             elif isinstance(token, ConsumedSlot):
                 idx = current_axis_names.index(token.name)
+
                 if token.op == "sum":
                     current_data = jnp.sum(current_data, axis=idx)
                 elif token.op == "mean":
@@ -1323,6 +1419,18 @@ class AxiomTensor:
                     current_data = jnp.var(current_data, axis=idx)
                 elif token.op == "std":
                     current_data = jnp.std(current_data, axis=idx)
+
+                # --- Phase 2: Advanced Reductions ---
+                elif token.op == "logsumexp":
+                    current_data = jsp.special.logsumexp(current_data, axis=idx)
+                elif token.op == "argmax":
+                    current_data = jnp.argmax(current_data, axis=idx)
+                elif token.op == "argmin":
+                    current_data = jnp.argmin(current_data, axis=idx)
+                elif token.op == "any":
+                    current_data = jnp.any(current_data, axis=idx)
+                elif token.op == "all":
+                    current_data = jnp.all(current_data, axis=idx)
                 else:
                     raise AxiomSyntaxError(f"Unknown reduction op '{token.op}'.")
                 current_axis_names.pop(idx)

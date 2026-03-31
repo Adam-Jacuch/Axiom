@@ -228,6 +228,23 @@ class AttendOp:
     def __repr__(self):
         return f"AttendOp(causal={self.is_causal})"
 
+class ClampOp:
+    def __init__(self, min_val=None, max_val=None):
+        self.min_val = min_val
+        self.max_val = max_val
+
+class StopGradientOp:
+    def __repr__(self):
+        return "StopGradientOp()"
+
+class ScatterOp:
+    def __init__(self, indices, updates, mode="update"):
+        if mode not in ("update", "add"):
+            raise ValueError("scatter mode must be 'update' or 'add'.")
+        self.indices = indices
+        self.updates = updates
+        self.mode = mode
+
 
 def _validate_pack_child(axis):
     if not isinstance(axis, Axis):
@@ -422,6 +439,30 @@ class PackedAxis:
 
     def softmax(self):
         return self._spawn(list(self.ops) + ["softmax"])
+
+    # --- Phase 1: Pointwise ---
+    def clamp(self, min=None, max=None):
+        return self._spawn(list(self.ops) + [ClampOp(min_val=min, max_val=max)])
+
+    def exp(self): return self._spawn(list(self.ops) + ["exp"])
+
+    def log(self): return self._spawn(list(self.ops) + ["log"])
+
+    def abs(self): return self._spawn(list(self.ops) + ["abs"])
+
+    def rsqrt(self): return self._spawn(list(self.ops) + ["rsqrt"])
+
+    def swiglu(self): return self._spawn(list(self.ops) + ["swiglu"])
+
+    # --- Phase 3: Sparse & Gradient Control ---
+    def stop_gradient(self):
+        return self._spawn(list(self.ops) + [StopGradientOp()])
+
+    def scatter(self, indices, updates, mode="update"):
+        return self._spawn(list(self.ops) + [ScatterOp(indices, updates, mode)])
+
+    def __repr__(self):
+        return f"PackedAxis({', '.join([a.name for a in self.axes])})"
 
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
@@ -701,6 +742,63 @@ class Axis:
 
     def std(self) -> ConsumedSlot:
         return ConsumedSlot(self.name, "std", source_name=getattr(self, "source_name", self.name))
+
+    # --- Phase 1: Pointwise ---
+    def clamp(self, min=None, max=None):
+        return Axis(self.name, self.size, list(self.ops) + [ClampOp(min_val=min, max_val=max)], self.source_name)
+
+    def exp(self): return Axis(self.name, self.size, list(self.ops) + ["exp"], self.source_name)
+
+    def log(self): return Axis(self.name, self.size, list(self.ops) + ["log"], self.source_name)
+
+    def abs(self): return Axis(self.name, self.size, list(self.ops) + ["abs"], self.source_name)
+
+    def rsqrt(self): return Axis(self.name, self.size, list(self.ops) + ["rsqrt"], self.source_name)
+
+    def swiglu(self): return Axis(self.name, self.size, list(self.ops) + ["swiglu"], self.source_name)
+
+    # --- Phase 3: Sparse & Gradient Control ---
+    def stop_gradient(self):
+        return Axis(self.name, self.size, list(self.ops) + [StopGradientOp()], self.source_name)
+
+    def scatter(self, indices, updates, mode="update"):
+        return Axis(self.name, self.size, list(self.ops) + [ScatterOp(indices, updates, mode)], self.source_name)
+
+    # --- Phase 2: Advanced Reductions ---
+    # Existing...
+    def sum(self) -> ConsumedSlot: return ConsumedSlot(self.name, "sum",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    def mean(self) -> ConsumedSlot: return ConsumedSlot(self.name, "mean",
+                                                        source_name=getattr(self, "source_name", self.name))
+
+    def max(self) -> ConsumedSlot: return ConsumedSlot(self.name, "max",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    def min(self) -> ConsumedSlot: return ConsumedSlot(self.name, "min",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    def var(self) -> ConsumedSlot: return ConsumedSlot(self.name, "var",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    def std(self) -> ConsumedSlot: return ConsumedSlot(self.name, "std",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    # New Reductions...
+    def logsumexp(self) -> ConsumedSlot: return ConsumedSlot(self.name, "logsumexp",
+                                                             source_name=getattr(self, "source_name", self.name))
+
+    def argmax(self) -> ConsumedSlot: return ConsumedSlot(self.name, "argmax",
+                                                          source_name=getattr(self, "source_name", self.name))
+
+    def argmin(self) -> ConsumedSlot: return ConsumedSlot(self.name, "argmin",
+                                                          source_name=getattr(self, "source_name", self.name))
+
+    def any(self) -> ConsumedSlot: return ConsumedSlot(self.name, "any",
+                                                       source_name=getattr(self, "source_name", self.name))
+
+    def all(self) -> ConsumedSlot: return ConsumedSlot(self.name, "all",
+                                                       source_name=getattr(self, "source_name", self.name))
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"

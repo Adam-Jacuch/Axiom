@@ -8,6 +8,8 @@ from axiom import ax, tensor, Module
 from axiom.exceptions import AxiomShapeError, AxiomSyntaxError
 from axiom.core.axis import SymbolicSize
 
+import jax.scipy as jsp
+
 
 def const_init(value, dtype=jnp.float32):
     def _init(rng, shape, param_dtype=None):
@@ -667,6 +669,152 @@ class AxiomRuntimeTests(unittest.TestCase):
 
         assert_axes(self, ctx, ["b", "h", "sq", "dh"], [2, 4, 8, 16])
         self.assertEqual(ctx.data.shape, (2, 4, 8, 16))
+
+    # -------------------------------------------------------------------------
+    # Phase 1: Pointwise Math & Activations
+    # -------------------------------------------------------------------------
+
+    def test_pointwise_math(self):
+        x = tensor(jnp.array([1.0, 4.0, 9.0], dtype=jnp.float32), ax.d)
+
+        cases = [
+            ("exp", jnp.exp(x.data)),
+            ("log", jnp.log(x.data)),
+            ("abs", jnp.abs(x.data)),
+            ("rsqrt", jax.lax.rsqrt(x.data)),
+        ]
+
+        for op_name, expected in cases:
+            with self.subTest(op_name=op_name):
+                token = getattr(ax.d, op_name)()
+                y = x[token]
+                assert_axes(self, y, ["d"], [3])
+                assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_clamp_op(self):
+        x = tensor(jnp.array([-5.0, 0.0, 5.0], dtype=jnp.float32), ax.d)
+        y = x[ax.d.clamp(-1.0, 1.0)]
+
+        expected = jnp.array([-1.0, 0.0, 1.0], dtype=jnp.float32)
+        assert_axes(self, y, ["d"], [3])
+        assert_allclose(y.data, expected)
+
+    def test_swiglu_op_halves_dimension(self):
+        x = tensor(jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32), ax.d)
+        y = x[ax.d.swiglu()]
+
+        chunk1, chunk2 = jnp.array([1.0, 2.0]), jnp.array([3.0, 4.0])
+        expected = jax.nn.silu(chunk1) * chunk2
+
+        # The axis should automatically be halved!
+        assert_axes(self, y, ["d"], [2])
+        assert_allclose(y.data, expected)
+
+    # -------------------------------------------------------------------------
+    # Phase 2: Advanced Reductions
+    # -------------------------------------------------------------------------
+
+    def test_logsumexp_reduction(self):
+        x = tensor(jnp.array([[1.0, 2.0, 4.0], [3.0, 5.0, 7.0]], dtype=jnp.float32), ax.b, ax.d)
+        y = x[ax.b, ax.d.logsumexp()]
+
+        expected = jsp.special.logsumexp(x.data, axis=1)
+        assert_axes(self, y, ["b"], [2])
+        assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_argmax_argmin_reductions(self):
+        x = tensor(jnp.array([[1.0, 4.0, 2.0], [7.0, 5.0, 9.0]], dtype=jnp.float32), ax.b, ax.d)
+
+        y_max = x[ax.b, ax.d.argmax()]
+        y_min = x[ax.b, ax.d.argmin()]
+
+        assert_axes(self, y_max, ["b"], [2])
+        assert_axes(self, y_min, ["b"], [2])
+        assert_allclose(y_max.data, jnp.argmax(x.data, axis=1))
+        assert_allclose(y_min.data, jnp.argmin(x.data, axis=1))
+
+    def test_any_all_reductions(self):
+        x = tensor(jnp.array([[True, False], [True, True]]), ax.b, ax.d)
+
+        y_any = x[ax.b, ax.d.any()]
+        y_all = x[ax.b, ax.d.all()]
+
+        assert_axes(self, y_any, ["b"], [2])
+        assert_axes(self, y_all, ["b"], [2])
+
+        self.assertTrue(jnp.array_equal(y_any.data, jnp.array([True, True])))
+        self.assertTrue(jnp.array_equal(y_all.data, jnp.array([False, True])))
+
+    # -------------------------------------------------------------------------
+    # Phase 3: Sparse Routing, Control, & Structural
+    # -------------------------------------------------------------------------
+
+    def test_stop_gradient_is_noop_on_forward_pass(self):
+        x = tensor(jnp.array([1.0, 2.0], dtype=jnp.float32), ax.d)
+        y = x[ax.d.stop_gradient()]
+
+        assert_axes(self, y, ["d"], [2])
+        assert_allclose(y.data, x.data)
+
+    def test_scatter_op_update_and_add(self):
+        x = tensor(jnp.zeros(4, dtype=jnp.float32), ax.d)
+        idx = tensor(jnp.array([1, 3], dtype=jnp.int32), ax.s)
+        updates = tensor(jnp.array([10.0, 20.0], dtype=jnp.float32), ax.s)
+
+        # Test mode="update"
+        y_update = x[ax.d.scatter(idx, updates, mode="update")]
+        expected_update = jnp.array([0.0, 10.0, 0.0, 20.0], dtype=jnp.float32)
+        assert_axes(self, y_update, ["d"], [4])
+        assert_allclose(y_update.data, expected_update)
+
+        # Test mode="add"
+        x_base = tensor(jnp.ones(4, dtype=jnp.float32), ax.d)
+        y_add = x_base[ax.d.scatter(idx, updates, mode="add")]
+        expected_add = jnp.array([1.0, 11.0, 1.0, 21.0], dtype=jnp.float32)
+        assert_allclose(y_add.data, expected_add)
+
+    def test_structural_split(self):
+        x = tensor(jnp.arange(12).reshape(2, 6), ax.b, ax.s)
+
+        # Split sequence into 2 chunks of size 3
+        chunks = x.split(ax.s, 2)
+
+        self.assertEqual(len(chunks), 2)
+        assert_axes(self, chunks[0], ["b", "s"], [2, 3])
+        assert_axes(self, chunks[1], ["b", "s"], [2, 3])
+
+        expected_chunk_0 = jnp.array([[0, 1, 2], [6, 7, 8]])
+        expected_chunk_1 = jnp.array([[3, 4, 5], [9, 10, 11]])
+
+        assert_allclose(chunks[0].data, expected_chunk_0)
+        assert_allclose(chunks[1].data, expected_chunk_1)
+
+    def test_structural_concat(self):
+        from axiom import AxiomTensor
+
+        t1 = tensor(jnp.ones((2, 3)), ax.b, ax.s)
+        t2 = tensor(jnp.zeros((2, 4)), ax.b, ax.s)
+
+        y = AxiomTensor.concat([t1, t2], axis=ax.s)
+
+        assert_axes(self, y, ["b", "s"], [2, 7])
+        self.assertEqual(y.data.shape, (2, 7))
+        assert_allclose(y.data[:, :3], jnp.ones((2, 3)))
+        assert_allclose(y.data[:, 3:], jnp.zeros((2, 4)))
+
+    def test_structural_topk(self):
+        x = tensor(jnp.array([[10.0, 50.0, 20.0, 40.0]], dtype=jnp.float32), ax.b, ax.vocab)
+
+        values, indices = x.topk(ax.vocab, k=2)
+
+        assert_axes(self, values, ["b", "vocab"], [1, 2])
+        assert_axes(self, indices, ["b", "vocab"], [1, 2])
+
+        expected_vals = jnp.array([[50.0, 40.0]], dtype=jnp.float32)
+        expected_idx = jnp.array([[1, 3]], dtype=jnp.int32)
+
+        assert_allclose(values.data, expected_vals)
+        assert_allclose(indices.data, expected_idx)
 
 
 if __name__ == "__main__":
