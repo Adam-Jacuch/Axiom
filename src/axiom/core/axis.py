@@ -195,6 +195,16 @@ class ScanOp:
         self.init = init
 
 
+class AssocScanOp:
+    def __init__(self, fn, inputs=None, reverse=False):
+        self.fn = fn
+        self.inputs = inputs if inputs is not None else tuple()
+        self.reverse = reverse
+
+    def __repr__(self):
+        return "AssocScanOp()"
+
+
 class WhereOp:
     def __init__(self, condition, false_tensor):
         self.condition = condition
@@ -413,11 +423,11 @@ class PackedAxis:
     def scan(self, fn, inputs=None, init=None):
         return self._spawn(list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple(), init=init)])
 
+    def assoc_scan(self, fn, inputs=None, reverse=False):
+        return self._spawn(list(self.ops) + [AssocScanOp(fn, inputs, reverse)])
+
     def dropout(self, rate=0.1):
         return self._spawn(list(self.ops) + [DropoutOp(rate)])
-
-    def scan(self, fn, inputs=None):
-        return self._spawn(list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple())])
 
     def cast(self, dtype):
         return self._spawn(list(self.ops) + [CastOp(dtype)])
@@ -682,6 +692,14 @@ class Axis:
             self.name,
             self.size,
             list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple(), init=init)],
+            self.source_name
+        )
+
+    def assoc_scan(self, fn, inputs=None, reverse=False):
+        return Axis(
+            self.name,
+            self.size,
+            list(self.ops) + [AssocScanOp(fn, inputs, reverse)],
             self.source_name
         )
 

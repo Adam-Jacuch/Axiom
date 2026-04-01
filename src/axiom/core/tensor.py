@@ -11,7 +11,7 @@ from .axis import (
     Axis, BiasOp, CastOp, ConsumedSlot, ConvOp, DropoutOp, GateOp, MaskOp,
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
-    ClampOp, StopGradientOp, ScatterOp
+    ClampOp, StopGradientOp, ScatterOp, AssocScanOp
 )
 from .module import context
 from .. import init as a_init
@@ -865,6 +865,28 @@ class AxiomTensor:
             elif isinstance(op, ClampOp):
                 # Updated to use JAX's modern 'min' and 'max' kwargs
                 current_data = jnp.clip(current_data, min=op.min_val, max=op.max_val)
+
+
+            elif isinstance(op, AssocScanOp):
+                scan_elems = [current_data]
+
+                # Align any extra input tensors to the current sequence axis
+                for extra in op.inputs:
+                    extra_names = [a.name for a in extra.axes]
+                    e_idx = extra_names.index(current_token.name)
+                    aligned_extra = jnp.moveaxis(extra.data, e_idx, idx)
+                    scan_elems.append(aligned_extra)
+
+                # JAX handles PyTrees natively! It will return a tuple of (x_out, a_out)
+                scanned_out = jax.lax.associative_scan(
+                    op.fn,
+                    tuple(scan_elems),
+                    reverse=op.reverse,
+                    axis=idx
+                )
+
+                # The active routing chain continues with the primary tensor (x_out)
+                current_data = scanned_out[0]
 
             # --- Phase 3: Control & Scatter ---
             elif isinstance(op, StopGradientOp):

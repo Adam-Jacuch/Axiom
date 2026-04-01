@@ -816,6 +816,41 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_allclose(values.data, expected_vals)
         assert_allclose(indices.data, expected_idx)
 
+    def test_associative_scan_linear_recurrence(self):
+        # 1. Setup data
+        B, S, D = 2, 5, 3
+        np.random.seed(42)
+
+        # Standard normal inputs
+        x_data = jnp.array(np.random.randn(B, S, D), dtype=jnp.float32)
+
+        # Gates usually between 0 and 1
+        a_data = jnp.array(np.random.uniform(0.1, 0.9, (B, S, D)), dtype=jnp.float32)
+
+        X = tensor(x_data, ax.b, ax.s, ax.d)
+        A = tensor(a_data, ax.b, ax.s, ax.d)
+
+        # 2. Define the strictly associative combiner for (x, a)
+        def linear_combine(i, j):
+            x_i, a_i = i
+            x_j, a_j = j
+            return a_j * x_i + x_j, a_j * a_i
+
+        # 3. Route through Axiom's associative scan (FIXED: Added ax.b and ax.d)
+        Y = X[ax.b, ax.s.assoc_scan(linear_combine, inputs=(A,)), ax.d]
+
+        # 4. Compute the ground truth sequentially to prove the parallel math works
+        expected_y = np.zeros_like(x_data)
+        carry = np.zeros_like(x_data[:, 0, :])
+
+        for t in range(S):
+            carry = a_data[:, t, :] * carry + x_data[:, t, :]
+            expected_y[:, t, :] = carry
+
+        # 5. Verify shapes and numerical equivalence
+        assert_axes(self, Y, ["b", "s", "d"], [B, S, D])
+        assert_allclose(Y.data, expected_y, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
