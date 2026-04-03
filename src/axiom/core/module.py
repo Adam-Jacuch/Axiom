@@ -31,13 +31,13 @@ class Module(nnx.Module):
             @functools.wraps(original_call)
             def wrapped_call(self, *args, **kwds):
                 context.stack.append(self)
-                self._axiom_param_counter = 0
+                object.__setattr__(self, '_axiom_param_counter', 0)
                 try:
                     result = original_call(self, *args, **kwds)
                 except Exception:
                     raise
                 else:
-                    self._axiom_initialized = True
+                    object.__setattr__(self, '_axiom_initialized', True)
                     return result
                 finally:
                     context.stack.pop()
