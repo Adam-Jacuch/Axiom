@@ -147,7 +147,7 @@ class AxiomTensor:
             raise ValueError("Embedding requires an explicit output size, e.g. ax.d(128).")
 
         param_name = f"_axiom_embed_{active_mod._axiom_param_counter}"
-        active_mod._axiom_param_counter += 1
+        object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
         if not getattr(active_mod, "_axiom_initialized", False):
             e_dtype = dtype if dtype is not None else jnp.float32
@@ -468,7 +468,7 @@ class AxiomTensor:
     def _get_or_create_param(self, prefix: str, shape, init_fn):
         active_mod = self._require_active_module(prefix)
         param_name = f"{prefix}_{active_mod._axiom_param_counter}"
-        active_mod._axiom_param_counter += 1
+        object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
         if not getattr(active_mod, "_axiom_initialized", False):
             rng = nnx.Rngs(0)()
@@ -1039,7 +1039,7 @@ class AxiomTensor:
             elif isinstance(op, DropoutOp):
                 active_mod = self._require_active_module("Dropout")
                 param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
-                active_mod._axiom_param_counter += 1
+                object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
                 if not getattr(active_mod, "_axiom_initialized", False):
                     setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=nnx.Rngs(dropout=0)))
@@ -1202,7 +1202,7 @@ class AxiomTensor:
                 if op.weight is None:
                     active_mod = self._require_active_module("Implicit .proj()")
                     param_name = f"_axiom_proj_{active_mod._axiom_param_counter}"
-                    active_mod._axiom_param_counter += 1
+                    object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
                     if not getattr(active_mod, "_axiom_initialized", False):
                         k_init = op.kernel_init if op.kernel_init is not None else a_init.default_kernel_init
