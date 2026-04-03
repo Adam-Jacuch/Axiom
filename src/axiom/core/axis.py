@@ -58,6 +58,9 @@ class CastOp:
 
 class MaskOp:
     def __init__(self, kind: str, other_axis: str = "left", fill_value=None):
+        kind = kind.lower()
+        other_axis = other_axis.lower()
+
         if kind not in ("tril", "triu"):
             raise ValueError("mask() currently supports only 'tril' and 'triu'.")
         if other_axis != "left":
@@ -68,7 +71,6 @@ class MaskOp:
 
     def __repr__(self):
         return f"MaskOp(kind='{self.kind}', other_axis='{self.other_axis}')"
-
 
 class ProjOp:
     def __init__(
@@ -107,21 +109,48 @@ class ConvOp:
             bias_init=None,
             weight=None,
             bias=None,
+            dilation=None,
+            groups=1,
     ):
         if bias is not None and use_bias:
             raise ValueError("conv(...): cannot provide explicit bias and also set use_bias=True.")
+        if not isinstance(groups, int) or groups <= 0:
+            raise ValueError("conv(...): groups must be a positive integer.")
+
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,)
+        if strides is None:
+            strides = (1,) * len(kernel_size)
+        elif isinstance(strides, int):
+            strides = (strides,)
+        if dilation is None:
+            dilation = (1,) * len(kernel_size)
+        elif isinstance(dilation, int):
+            dilation = (dilation,)
+
+        if len(strides) != len(kernel_size):
+            raise ValueError("conv(...): strides must have the same rank as kernel_size.")
+        if len(dilation) != len(kernel_size):
+            raise ValueError("conv(...): dilation must have the same rank as kernel_size.")
+
         self.features = features
         self.kernel_size = tuple(kernel_size)
-        self.strides = tuple(strides) if strides is not None else (1,) * len(self.kernel_size)
+        self.strides = tuple(strides)
         self.padding = padding
         self.use_bias = use_bias
         self.kernel_init = kernel_init
         self.bias_init = bias_init
         self.weight = weight
         self.bias = bias
+        self.dilation = tuple(dilation)
+        self.groups = groups
 
     def __repr__(self):
-        return f"ConvOp(kernel_size={self.kernel_size}, use_bias={self.use_bias})"
+        return (
+            f"ConvOp(kernel_size={self.kernel_size}, strides={self.strides}, "
+            f"dilation={self.dilation}, padding={self.padding}, groups={self.groups}, "
+            f"use_bias={self.use_bias})"
+        )
 
 
 class BiasOp:
@@ -474,10 +503,6 @@ class PackedAxis:
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
 
-    def __repr__(self):
-        return f"PackedAxis({', '.join([a.name for a in self.axes])})"
-
-
 class Axis:
     # Removed strict int type hint from size to cleanly allow SymbolicSize
     def __init__(self, name: str, size=None, ops: list = None, source_name: str = None):
@@ -572,6 +597,8 @@ class Axis:
             bias_init=None,
             weight=None,
             bias=None,
+            dilation=None,
+            groups=1,
     ):
         out_axis = features if isinstance(features, Axis) else Axis(self.name, features)
         new_ops = list(self.ops) + [
@@ -585,6 +612,8 @@ class Axis:
                 bias_init=bias_init,
                 weight=weight,
                 bias=bias,
+                dilation=dilation,
+                groups=groups,
             )
         ]
         return Axis(self.name, self.size, new_ops, self.source_name)
@@ -712,14 +741,6 @@ class Axis:
 
     def dropout(self, rate=0.1):
         return Axis(self.name, self.size, list(self.ops) + [DropoutOp(rate)], self.source_name)
-
-    def scan(self, fn, inputs=None):
-        return Axis(
-            self.name,
-            self.size,
-            list(self.ops) + [ScanOp(fn, inputs if inputs is not None else tuple())],
-            self.source_name,
-        )
 
     def cast(self, dtype):
         return self.__class__(self.name, self.size, list(self.ops) + [CastOp(dtype)],

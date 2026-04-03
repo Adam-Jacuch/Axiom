@@ -717,28 +717,99 @@ class AxiomTensor:
         alphabet = "QRSTUVWXYZABCDEFGHIJKLMNOP"
         if spatial_rank > len(alphabet):
             raise AxiomShapeError(
-                f"Conv with spatial rank {spatial_rank} is too large for symbolic dimension encoding.")
+                f"Conv with spatial rank {spatial_rank} is too large for symbolic dimension encoding."
+            )
         spatial = alphabet[:spatial_rank]
         return ("N" + spatial + "C", spatial + "IO", "N" + spatial + "C")
 
-    def _apply_explicit_conv(self, current_data, idx: int, op: ConvOp):
-        x = jnp.moveaxis(current_data, idx, -1)
+    def _normalize_conv_padding(self, op: ConvOp):
         spatial_rank = len(op.kernel_size)
-        if x.ndim < spatial_rank + 1:
+        padding = op.padding
+
+        if isinstance(padding, str):
+            padding = padding.lower()
+
+            if padding == "same":
+                return "SAME"
+
+            if padding == "valid":
+                return "VALID"
+
+            if padding == "causal":
+                if spatial_rank != 1:
+                    raise AxiomShapeError("padding='causal' is only supported for 1D convolutions.")
+                left = op.dilation[0] * (op.kernel_size[0] - 1)
+                return ((left, 0),)
+
             raise AxiomShapeError(
-                f"Conv with kernel rank {spatial_rank} requires at least {spatial_rank + 1} dims after moving channels last."
+                f"Unsupported conv padding string '{op.padding}'. Use 'same', 'valid', or 'causal'."
             )
 
-        weight = jnp.asarray(op.weight.data if isinstance(op.weight, AxiomTensor) else op.weight)
-        if weight.ndim != spatial_rank + 2:
-            raise AxiomShapeError(f"Explicit conv weight must have rank {spatial_rank + 2}, got {weight.ndim}.")
-        if tuple(weight.shape[:spatial_rank]) != tuple(op.kernel_size):
+        # Allow 1D shorthand like (3, 0)
+        if (
+                spatial_rank == 1
+                and isinstance(padding, (tuple, list))
+                and len(padding) == 2
+                and all(isinstance(x, int) for x in padding)
+        ):
+            return (tuple(padding),)
+
+        if not isinstance(padding, (tuple, list)):
             raise AxiomShapeError(
-                f"Explicit conv kernel shape mismatch: expected spatial kernel {op.kernel_size}, got {weight.shape[:spatial_rank]}."
+                "Explicit conv padding must be a string or a tuple/list of (low, high) pairs."
             )
-        if weight.shape[-2] != x.shape[-1]:
+
+        padding = tuple(tuple(p) for p in padding)
+        if len(padding) != spatial_rank or any(len(p) != 2 for p in padding):
             raise AxiomShapeError(
-                f"Explicit conv in_features mismatch: expected {x.shape[-1]}, got {weight.shape[-2]}."
+                f"Explicit conv padding must have one (low, high) pair per spatial dim. "
+                f"Expected rank {spatial_rank}, got {padding}."
+            )
+
+        return padding
+
+    def _run_lax_conv(self, current_data, idx: int, kernel, op: ConvOp):
+        x = jnp.moveaxis(current_data, idx, -1)
+        spatial_rank = len(op.kernel_size)
+
+        if x.ndim < spatial_rank + 1:
+            raise AxiomShapeError(
+                f"Conv with kernel rank {spatial_rank} requires at least {spatial_rank + 1} dims "
+                f"after moving channels last."
+            )
+
+        if len(op.strides) != spatial_rank:
+            raise AxiomShapeError(
+                f"Conv strides rank mismatch: expected {spatial_rank}, got {len(op.strides)}."
+            )
+        if len(op.dilation) != spatial_rank:
+            raise AxiomShapeError(
+                f"Conv dilation rank mismatch: expected {spatial_rank}, got {len(op.dilation)}."
+            )
+
+        in_features = int(x.shape[-1])
+        if in_features % op.groups != 0:
+            raise AxiomShapeError(
+                f"Conv groups mismatch: input features {in_features} must be divisible by groups={op.groups}."
+            )
+
+        kernel = jnp.asarray(kernel)
+        if kernel.ndim != spatial_rank + 2:
+            raise AxiomShapeError(
+                f"Conv kernel must have rank {spatial_rank + 2}, got {kernel.ndim}."
+            )
+
+        if tuple(kernel.shape[:spatial_rank]) != tuple(op.kernel_size):
+            raise AxiomShapeError(
+                f"Conv kernel shape mismatch: expected spatial kernel {op.kernel_size}, "
+                f"got {kernel.shape[:spatial_rank]}."
+            )
+
+        expected_in_per_group = in_features // op.groups
+        if int(kernel.shape[-2]) != expected_in_per_group:
+            raise AxiomShapeError(
+                f"Conv kernel in_features mismatch: expected {expected_in_per_group} "
+                f"(input features per group), got {kernel.shape[-2]}."
             )
 
         batch_shape = x.shape[: x.ndim - spatial_rank - 1]
@@ -752,10 +823,12 @@ class AxiomTensor:
 
         y = jax.lax.conv_general_dilated(
             lhs=x,
-            rhs=weight,
+            rhs=kernel,
             window_strides=op.strides,
-            padding=op.padding,
+            padding=self._normalize_conv_padding(op),
+            rhs_dilation=op.dilation,
             dimension_numbers=self._conv_dimension_numbers(spatial_rank),
+            feature_group_count=op.groups,
         )
 
         if len(original_batch_shape) == 0:
@@ -763,8 +836,26 @@ class AxiomTensor:
         elif len(original_batch_shape) > 1:
             y = y.reshape(original_batch_shape + y.shape[1:])
 
-        out_features = weight.shape[-1]
+        out_features = int(kernel.shape[-1])
         return jnp.moveaxis(y, -1, idx), out_features
+
+    def _apply_explicit_conv(self, current_data, idx: int, op: ConvOp):
+        weight = op.weight.data if isinstance(op.weight, AxiomTensor) else op.weight
+        return self._run_lax_conv(current_data, idx, weight, op)
+
+    def _apply_implicit_conv(self, current_data, idx: int, op: ConvOp, out_features: int):
+        in_features = int(current_data.shape[idx])
+
+        if in_features % op.groups != 0:
+            raise AxiomShapeError(
+                f"Implicit conv groups mismatch: input features {in_features} must be divisible by groups={op.groups}."
+            )
+
+        kernel_shape = tuple(op.kernel_size) + (in_features // op.groups, out_features)
+        k_init = op.kernel_init if op.kernel_init is not None else a_init.default_kernel_init
+        kernel = self._get_or_create_param("_axiom_conv_kernel", kernel_shape, k_init)
+
+        return self._run_lax_conv(current_data, idx, kernel, op)
 
     def _expand_packed_token_for_rhs(self, token: PackedAxis, physical_size: int):
         known_prod = 1
@@ -1083,63 +1174,41 @@ class AxiomTensor:
 
                 current_data = jnp.swapaxes(scanned_out, 0, idx)
 
-
-
             elif isinstance(op, AttendOp):
-
                 q_seq_name = current_axis_names[idx]
-
                 dim_name = op.dim.name if hasattr(op.dim, "name") else str(op.dim)
-
                 if dim_name not in current_axis_names:
                     raise AxiomShapeError(f".attend() requires feature dimension '{dim_name}' in the query tensor.")
 
                 # 1. Identify query layout
-
                 batch_names = [n for n in current_axis_names if n not in (q_seq_name, dim_name)]
-
                 q_target_layout = batch_names + [q_seq_name, dim_name]
-
                 q_perm = [current_axis_names.index(n) for n in q_target_layout]
-
                 q_aligned = jnp.transpose(current_data, q_perm)
 
                 # Flatten batch & head names into a single dimension, and insert num_heads=1
-
                 # Shape becomes: (batch_flat, seq_len, 1, dim_size)
-
                 batch_size_flat = math.prod(q_aligned.shape[:-2]) if batch_names else 1
-
                 q_seq_len = q_aligned.shape[-2]
-
                 dim_size = q_aligned.shape[-1]
-
                 q_reshaped = jnp.reshape(q_aligned, (batch_size_flat, q_seq_len, 1, dim_size))
 
                 # 2. Identify keys/values layout
-
                 if not isinstance(op.keys, AxiomTensor) or not isinstance(op.values, AxiomTensor):
                     raise TypeError(".attend() requires explicit keys and values to be AxiomTensors.")
 
                 k_names = [a.name for a in op.keys.axes]
-
                 v_names = [a.name for a in op.values.axes]
-
                 kv_seq_candidates = [n for n in k_names if n not in batch_names and n != dim_name]
 
                 if len(kv_seq_candidates) != 1:
                     raise AxiomShapeError(
-
                         f"Could not automatically infer the kv-sequence axis. "
-
                         f"Keys: {k_names}, Batch: {batch_names}, Feature: {dim_name}"
-
                     )
 
                 kv_seq_name = kv_seq_candidates[0]
-
                 kv_target_layout = batch_names + [kv_seq_name, dim_name]
-
                 if set(k_names) != set(kv_target_layout):
                     raise AxiomShapeError(f"Keys tensor must have exactly axes {kv_target_layout}. Got {k_names}.")
 
@@ -1147,34 +1216,24 @@ class AxiomTensor:
                     raise AxiomShapeError(f"Values tensor must have exactly axes {kv_target_layout}. Got {v_names}.")
 
                 k_aligned = jnp.transpose(op.keys.data, [k_names.index(n) for n in kv_target_layout])
-
                 kv_seq_len = k_aligned.shape[-2]
-
                 k_reshaped = jnp.reshape(k_aligned, (batch_size_flat, kv_seq_len, 1, dim_size))
-
                 v_aligned = jnp.transpose(op.values.data, [v_names.index(n) for n in kv_target_layout])
-
                 v_reshaped = jnp.reshape(v_aligned, (batch_size_flat, kv_seq_len, 1, dim_size))
 
                 # 3. Create boolean causal mask if requested
-
                 mask = None
 
                 if op.is_causal:
                     mask = jnp.arange(q_seq_len)[:, None] >= jnp.arange(kv_seq_len)[None, :]
 
                 # 4. Execute FlashAttention Backend
-
                 # JAX dot_product_attention now gets the exact 4D shape it strictly requires
-
                 attended = jax.nn.dot_product_attention(q_reshaped, k_reshaped, v_reshaped, mask=mask)
 
                 # 5. Restore user's original logical layout
-
                 attended_unflattened = jnp.reshape(attended, q_aligned.shape)
-
                 restore_perm = [q_target_layout.index(n) for n in current_axis_names]
-
                 current_data = jnp.transpose(attended_unflattened, restore_perm)
 
             elif isinstance(op, ProjOp):
@@ -1274,75 +1333,82 @@ class AxiomTensor:
                     param_prefix="_axiom_proj_bias",
                 )
 
+
             elif isinstance(op, ConvOp):
+
                 # Dynamically resolve any symbolic features size right before executing
+
                 size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+
                 resolved_features = self._resolve_token_sizes(op.features, size_map)
 
-                in_features = int(current_data.shape[idx])
-
                 self._check_axis_rename_collision(
+
                     current_axis_names,
+
                     idx,
+
                     resolved_features.name,
+
                     "conv output",
+
                 )
 
                 if op.weight is None:
+
                     if resolved_features.size is None:
                         raise AxiomShapeError("Implicit conv requires an explicit output feature size.")
+
                     out_features = resolved_features.size
 
-                    active_mod = self._require_active_module("Implicit .conv()")
-                    param_name = f"_axiom_conv_{active_mod._axiom_param_counter}"
-                    active_mod._axiom_param_counter += 1
+                    current_data, actual_out = self._apply_implicit_conv(current_data, idx, op, out_features)
 
-                    if not getattr(active_mod, "_axiom_initialized", False):
-                        k_init = op.kernel_init if op.kernel_init is not None else a_init.default_kernel_init
-                        setattr(
-                            active_mod,
-                            param_name,
-                            nnx.Conv(
-                                in_features=in_features,
-                                out_features=out_features,
-                                kernel_size=op.kernel_size,
-                                strides=op.strides,
-                                padding=op.padding,
-                                use_bias=False,
-                                kernel_init=k_init,
-                                rngs=nnx.Rngs(0),
-                            ),
+                    if actual_out != out_features:
+                        raise AxiomShapeError(
+
+                            f"Implicit conv internal mismatch: expected {out_features} output features, got {actual_out}."
+
                         )
 
-                    conv_layer = getattr(active_mod, param_name)
-                    current_data = jnp.moveaxis(current_data, idx, -1)
-                    current_data = conv_layer(current_data)
-                    current_data = jnp.moveaxis(current_data, -1, idx)
-
                 else:
+
                     current_data, out_features = self._apply_explicit_conv(current_data, idx, op)
+
                     if resolved_features.size is None:
+
                         resolved_features.size = out_features
+
                     elif resolved_features.size != out_features:
+
                         raise AxiomShapeError(
+
                             f"Explicit conv output feature mismatch: expected {resolved_features.size}, got {out_features}."
+
                         )
 
                 current_axis_names[idx] = resolved_features.name
+
                 self._assert_unique_names(current_axis_names, "conv output")
 
                 current_token = Axis(resolved_features.name, out_features, source_name=resolved_features.name)
 
                 current_data = self._apply_add_bias(
-                    current_data,
-                    current_axis_names,
-                    idx,
-                    explicit_bias=op.bias,
-                    use_implicit=(op.bias is None and op.use_bias),
-                    init_fn=op.bias_init,
-                    param_prefix="_axiom_conv_bias",
-                )
 
+                    current_data,
+
+                    current_axis_names,
+
+                    idx,
+
+                    explicit_bias=op.bias,
+
+                    use_implicit=(op.bias is None and op.use_bias),
+
+                    init_fn=op.bias_init,
+
+                    param_prefix="_axiom_conv_bias",
+
+                )
             current_token = self._materialize_token_size(current_token, int(current_data.shape[idx]))
 
         return current_data, current_axis_names, current_token
