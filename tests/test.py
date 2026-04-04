@@ -1084,5 +1084,49 @@ class AxiomRuntimeTests(unittest.TestCase):
         with self.assertRaises(AxiomSyntaxError):
             _ = x[ax.b, ax.s.dilate(2), ax.c]
 
+    def test_pointwise_math_trig_and_square(self):
+        # Testing with values where sin and cos have well-known behaviors
+        x = tensor(jnp.array([0.0, jnp.pi / 4, jnp.pi / 2, jnp.pi], dtype=jnp.float32), ax.d)
+
+        cases = [
+            ("square", jnp.square(x.data)),
+            ("sin", jnp.sin(x.data)),
+            ("cos", jnp.cos(x.data)),
+        ]
+
+        for op_name, expected in cases:
+            with self.subTest(op_name=op_name):
+                token = getattr(ax.d, op_name)()
+                y = x[token]
+                assert_axes(self, y, ["d"], [4])
+                assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_pointwise_math_rounding(self):
+        # Using positive and negative decimals to ensure floor/ceil/round behave correctly
+        x = tensor(jnp.array([-1.7, -1.2, 0.0, 1.2, 1.5, 1.7], dtype=jnp.float32), ax.d)
+
+        cases = [
+            ("round", jnp.round(x.data)),
+            ("floor", jnp.floor(x.data)),
+            ("ceil", jnp.ceil(x.data)),
+        ]
+
+        for op_name, expected in cases:
+            with self.subTest(op_name=op_name):
+                token = getattr(ax.d, op_name)()
+                y = x[token]
+                assert_axes(self, y, ["d"], [6])
+                assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
+    def test_pointwise_math_pow(self):
+        x = tensor(jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32), ax.d)
+
+        # Pow takes an argument, so it is tested separately from the 0-arity ops
+        y = x[ax.d.pow(3)]
+
+        expected = jnp.power(x.data, 3)
+        assert_axes(self, y, ["d"], [4])
+        assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

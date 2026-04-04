@@ -292,6 +292,10 @@ class AttendOp:
     def __repr__(self):
         return f"AttendOp(causal={self.is_causal})"
 
+class PowOp:
+    def __init__(self, exponent):
+        self.exponent = exponent
+
 class ClampOp:
     def __init__(self, min_val=None, max_val=None):
         self.min_val = min_val
@@ -520,6 +524,27 @@ class PackedAxis:
     def rsqrt(self): return self._spawn(list(self.ops) + ["rsqrt"])
 
     def swiglu(self): return self._spawn(list(self.ops) + ["swiglu"])
+
+    def square(self):
+        return self._spawn(list(self.ops) + ["square"])
+
+    def pow(self, exponent):
+        return self._spawn(list(self.ops) + [PowOp(exponent)])
+
+    def round(self):
+        return self._spawn(list(self.ops) + ["round"])
+
+    def floor(self):
+        return self._spawn(list(self.ops) + ["floor"])
+
+    def ceil(self):
+        return self._spawn(list(self.ops) + ["ceil"])
+
+    def sin(self):
+        return self._spawn(list(self.ops) + ["sin"])
+
+    def cos(self):
+        return self._spawn(list(self.ops) + ["cos"])
 
     # --- Phase 3: Sparse & Gradient Control ---
     def stop_gradient(self):
@@ -895,6 +920,27 @@ class Axis:
 
     def swiglu(self): return Axis(self.name, self.size, list(self.ops) + ["swiglu"], self.source_name)
 
+    def square(self):
+        return Axis(self.name, self.size, list(self.ops) + ["square"], self.source_name)
+
+    def pow(self, exponent):
+        return Axis(self.name, self.size, list(self.ops) + [PowOp(exponent)], self.source_name)
+
+    def round(self):
+        return Axis(self.name, self.size, list(self.ops) + ["round"], self.source_name)
+
+    def floor(self):
+        return Axis(self.name, self.size, list(self.ops) + ["floor"], self.source_name)
+
+    def ceil(self):
+        return Axis(self.name, self.size, list(self.ops) + ["ceil"], self.source_name)
+
+    def sin(self):
+        return Axis(self.name, self.size, list(self.ops) + ["sin"], self.source_name)
+
+    def cos(self):
+        return Axis(self.name, self.size, list(self.ops) + ["cos"], self.source_name)
+
     # --- Phase 3: Sparse & Gradient Control ---
     def stop_gradient(self):
         return Axis(self.name, self.size, list(self.ops) + [StopGradientOp()], self.source_name)
@@ -903,26 +949,6 @@ class Axis:
         return Axis(self.name, self.size, list(self.ops) + [ScatterOp(indices, updates, mode)], self.source_name)
 
     # --- Phase 2: Advanced Reductions ---
-    # Existing...
-    def sum(self) -> ConsumedSlot: return ConsumedSlot(self.name, "sum",
-                                                       source_name=getattr(self, "source_name", self.name))
-
-    def mean(self) -> ConsumedSlot: return ConsumedSlot(self.name, "mean",
-                                                        source_name=getattr(self, "source_name", self.name))
-
-    def max(self) -> ConsumedSlot: return ConsumedSlot(self.name, "max",
-                                                       source_name=getattr(self, "source_name", self.name))
-
-    def min(self) -> ConsumedSlot: return ConsumedSlot(self.name, "min",
-                                                       source_name=getattr(self, "source_name", self.name))
-
-    def var(self) -> ConsumedSlot: return ConsumedSlot(self.name, "var",
-                                                       source_name=getattr(self, "source_name", self.name))
-
-    def std(self) -> ConsumedSlot: return ConsumedSlot(self.name, "std",
-                                                       source_name=getattr(self, "source_name", self.name))
-
-    # New Reductions...
     def logsumexp(self) -> ConsumedSlot: return ConsumedSlot(self.name, "logsumexp",
                                                              source_name=getattr(self, "source_name", self.name))
 

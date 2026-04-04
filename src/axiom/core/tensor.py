@@ -12,7 +12,7 @@ from .axis import (
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
     ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
-    ConvModeOp, ConvStrideOp, ConvDilationOp,
+    ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp,
 )
 from .module import context
 from .. import init as a_init
@@ -1269,6 +1269,21 @@ class AxiomTensor:
                 # function at the end of the loop will catch the new size perfectly.
                 chunk1, chunk2 = jnp.split(current_data, 2, axis=idx)
                 current_data = jax.nn.silu(chunk1) * chunk2
+
+            elif op == "square":
+                current_data = jnp.square(current_data)
+            elif isinstance(op, PowOp):
+                current_data = jnp.power(current_data, op.exponent)
+            elif op == "round":
+                current_data = jnp.round(current_data)
+            elif op == "floor":
+                current_data = jnp.floor(current_data)
+            elif op == "ceil":
+                current_data = jnp.ceil(current_data)
+            elif op == "sin":
+                current_data = jnp.sin(current_data)
+            elif op == "cos":
+                current_data = jnp.cos(current_data)
 
 
             elif isinstance(op, ClampOp):
