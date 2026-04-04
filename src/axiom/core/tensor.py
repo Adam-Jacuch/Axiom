@@ -11,7 +11,8 @@ from .axis import (
     Axis, BiasOp, CastOp, ConsumedSlot, ConvOp, DropoutOp, GateOp, MaskOp,
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
-    ClampOp, StopGradientOp, ScatterOp, AssocScanOp
+    ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
+    ConvModeOp, ConvStrideOp, ConvDilationOp,
 )
 from .module import context
 from .. import init as a_init
@@ -722,75 +723,311 @@ class AxiomTensor:
         spatial = alphabet[:spatial_rank]
         return ("N" + spatial + "C", spatial + "IO", "N" + spatial + "C")
 
-    def _normalize_conv_padding(self, op: ConvOp):
-        spatial_rank = len(op.kernel_size)
-        padding = op.padding
+    def _normalize_conv_int_or_tuple(self, value, rank: int, *, name: str, default: int = 1):
+        if value is None:
+            return (default,) * rank
+        if isinstance(value, int):
+            if value <= 0:
+                raise AxiomShapeError(f"conv(...): {name} must be positive.")
+            return (value,) * rank
+        if isinstance(value, (tuple, list)):
+            if len(value) != rank:
+                raise AxiomShapeError(
+                    f"conv(...): {name} rank mismatch: expected {rank}, got {len(value)}."
+                )
+            if not all(isinstance(v, int) and v > 0 for v in value):
+                raise AxiomShapeError(f"conv(...): all {name} values must be positive integers.")
+            return tuple(value)
+        raise AxiomShapeError(
+            f"conv(...): {name} must be an int or a tuple/list of length {rank}."
+        )
 
-        if isinstance(padding, str):
-            padding = padding.lower()
-
-            if padding == "same":
-                return "SAME"
-
-            if padding == "valid":
-                return "VALID"
-
-            if padding == "causal":
-                if spatial_rank != 1:
-                    raise AxiomShapeError("padding='causal' is only supported for 1D convolutions.")
-                left = op.dilation[0] * (op.kernel_size[0] - 1)
-                return ((left, 0),)
-
-            raise AxiomShapeError(
-                f"Unsupported conv padding string '{op.padding}'. Use 'same', 'valid', or 'causal'."
-            )
-
-        # Allow 1D shorthand like (3, 0)
+    def _normalize_explicit_conv_pad(self, pad, rank: int):
+        # 1D shorthand: (left, right)
         if (
-                spatial_rank == 1
-                and isinstance(padding, (tuple, list))
-                and len(padding) == 2
-                and all(isinstance(x, int) for x in padding)
+                rank == 1
+                and isinstance(pad, (tuple, list))
+                and len(pad) == 2
+                and all(isinstance(x, int) for x in pad)
         ):
-            return (tuple(padding),)
+            return (tuple(pad),)
 
-        if not isinstance(padding, (tuple, list)):
+        if not isinstance(pad, (tuple, list)):
             raise AxiomShapeError(
-                "Explicit conv padding must be a string or a tuple/list of (low, high) pairs."
+                "conv(...): explicit pad must be a string-free tuple/list of (low, high) pairs."
             )
 
-        padding = tuple(tuple(p) for p in padding)
-        if len(padding) != spatial_rank or any(len(p) != 2 for p in padding):
+        pad = tuple(tuple(p) for p in pad)
+        if len(pad) != rank or any(len(p) != 2 for p in pad):
             raise AxiomShapeError(
-                f"Explicit conv padding must have one (low, high) pair per spatial dim. "
-                f"Expected rank {spatial_rank}, got {padding}."
+                f"conv(...): explicit pad must have one (low, high) pair per spatial dim. "
+                f"Expected rank {rank}, got {pad}."
+            )
+        if not all(isinstance(x, int) and x >= 0 for pair in pad for x in pair):
+            raise AxiomShapeError("conv(...): explicit pad values must be non-negative integers.")
+        return pad
+
+    def _resolve_conv_kernel(self, kernel, size_map: dict):
+        if isinstance(kernel, Axis):
+            kernel = self._resolve_token_sizes(kernel, size_map)
+            if kernel.ops:
+                raise AxiomShapeError("conv(kernel=...): kernel axes may not carry ops.")
+            if kernel.size is None:
+                raise AxiomShapeError("conv(kernel=...): named kernel axes must have known sizes.")
+            return (int(kernel.size),), [Axis(kernel.name, int(kernel.size), source_name=kernel.source_name)]
+
+        if isinstance(kernel, PackedAxis):
+            kernel = self._resolve_token_sizes(kernel, size_map)
+            axes = []
+            sizes = []
+            for a in kernel.axes:
+                if a.ops:
+                    raise AxiomShapeError("conv(kernel=...): kernel axes may not carry ops.")
+                if a.size is None:
+                    raise AxiomShapeError("conv(kernel=...): named kernel axes must have known sizes.")
+                axes.append(Axis(a.name, int(a.size), source_name=a.source_name))
+                sizes.append(int(a.size))
+            return tuple(sizes), axes
+
+        if isinstance(kernel, int):
+            if kernel <= 0:
+                raise AxiomShapeError("conv(kernel=...): integer kernel size must be positive.")
+            return (kernel,), None
+
+        if isinstance(kernel, (tuple, list)):
+            if not kernel:
+                raise AxiomShapeError("conv(kernel=...): kernel tuple must be non-empty.")
+            if not all(isinstance(k, int) and k > 0 for k in kernel):
+                raise AxiomShapeError("conv(kernel=...): all kernel sizes must be positive integers.")
+            return tuple(kernel), None
+
+        raise AxiomShapeError(
+            "conv(kernel=...): kernel must be an int, a tuple of ints, an Axis, or a PackedAxis."
+        )
+
+    def _strip_conv_domain_axis(self, axis: Axis):
+        mode = None
+        stride = 1
+        dilation = 1
+
+        for op in axis.ops:
+            if isinstance(op, ConvModeOp):
+                if mode is not None:
+                    raise AxiomShapeError(
+                        f"conv(over=...): axis '{axis.name}' has multiple conv modes attached."
+                    )
+                mode = op.mode
+            elif isinstance(op, ConvStrideOp):
+                if stride != 1:
+                    raise AxiomShapeError(
+                        f"conv(over=...): axis '{axis.name}' has multiple stride(...) modifiers."
+                    )
+                stride = op.value
+            elif isinstance(op, ConvDilationOp):
+                if dilation != 1:
+                    raise AxiomShapeError(
+                        f"conv(over=...): axis '{axis.name}' has multiple dilate(...) modifiers."
+                    )
+                dilation = op.value
+            else:
+                raise AxiomShapeError(
+                    f"conv(over=...): axis '{axis.name}' may only carry conv-domain modifiers "
+                    f"(same()/valid()/causal()/stride()/dilate())."
+                )
+
+        return Axis(axis.name, axis.size, source_name=axis.source_name), mode, stride, dilation
+
+    def _build_conv_padding(self, modes, kernel_sizes, dilations):
+        padding = []
+        for mode, k, d in zip(modes, kernel_sizes, dilations):
+            mode = "same" if mode is None else mode
+            total = d * (k - 1)
+
+            if mode == "same":
+                low = total // 2
+                high = total - low
+            elif mode == "valid":
+                low = 0
+                high = 0
+            elif mode == "causal":
+                low = total
+                high = 0
+            else:
+                raise AxiomShapeError(f"Unknown conv mode '{mode}'.")
+
+            padding.append((low, high))
+        return tuple(padding)
+
+    def _resolve_conv_over(self, op: ConvOp, current_axis_names, feature_idx: int, kernel_sizes, size_map: dict):
+        spatial_rank = len(kernel_sizes)
+
+        # Legacy mode: infer the last `spatial_rank` axes immediately to the left of the feature axis.
+        if op.over is None:
+            if feature_idx < spatial_rank:
+                raise AxiomShapeError(
+                    f"Legacy conv inference failed: feature axis index {feature_idx} does not have "
+                    f"{spatial_rank} spatial axes immediately to its left."
+                )
+
+            domain_indices = tuple(range(feature_idx - spatial_rank, feature_idx))
+            domain_axes = [
+                Axis(current_axis_names[i], int(size_map[current_axis_names[i]]), source_name=current_axis_names[i])
+                for i in domain_indices
+            ]
+
+            strides = self._normalize_conv_int_or_tuple(
+                op.legacy_strides, spatial_rank, name="legacy strides", default=1
+            )
+            dilations = self._normalize_conv_int_or_tuple(
+                op.legacy_dilation, spatial_rank, name="legacy dilation", default=1
             )
 
-        return padding
+            if op.legacy_padding is None:
+                padding = self._build_conv_padding([None] * spatial_rank, kernel_sizes, dilations)
+            elif isinstance(op.legacy_padding, str):
+                p = op.legacy_padding.lower()
+                if p == "same":
+                    padding = self._build_conv_padding(["same"] * spatial_rank, kernel_sizes, dilations)
+                elif p == "valid":
+                    padding = self._build_conv_padding(["valid"] * spatial_rank, kernel_sizes, dilations)
+                elif p == "causal":
+                    if spatial_rank != 1:
+                        raise AxiomShapeError("Legacy padding='causal' is only valid for 1D convolution.")
+                    padding = self._build_conv_padding(["causal"], kernel_sizes, dilations)
+                else:
+                    raise AxiomShapeError(
+                        f"Unsupported legacy conv padding string '{op.legacy_padding}'. "
+                        f"Use 'same', 'valid', or 'causal'."
+                    )
+            else:
+                padding = self._normalize_explicit_conv_pad(op.legacy_padding, spatial_rank)
 
-    def _run_lax_conv(self, current_data, idx: int, kernel, op: ConvOp):
-        x = jnp.moveaxis(current_data, idx, -1)
-        spatial_rank = len(op.kernel_size)
+            return domain_axes, domain_indices, strides, dilations, padding
 
-        if x.ndim < spatial_rank + 1:
+        # Canonical mode: over=Axis | PackedAxis with domain metadata on the axes themselves.
+        resolved_over = self._resolve_token_sizes(op.over, size_map)
+        flat_over = list(resolved_over.axes) if isinstance(resolved_over, PackedAxis) else [resolved_over]
+
+        if len(flat_over) != spatial_rank:
             raise AxiomShapeError(
-                f"Conv with kernel rank {spatial_rank} requires at least {spatial_rank + 1} dims "
-                f"after moving channels last."
+                f"conv(...): kernel rank {spatial_rank} does not match the number of domain axes in over={len(flat_over)}."
             )
 
-        if len(op.strides) != spatial_rank:
+        domain_axes = []
+        domain_indices = []
+        modes = []
+        strides = []
+        dilations = []
+
+        for a in flat_over:
+            base_axis, mode, stride, dilation = self._strip_conv_domain_axis(a)
+
+            if base_axis.name not in current_axis_names:
+                raise AxiomShapeError(
+                    f"conv(...): over-axis '{base_axis.name}' is not present in the current tensor axes {current_axis_names}."
+                )
+
+            axis_idx = current_axis_names.index(base_axis.name)
+            domain_axes.append(base_axis)
+            domain_indices.append(axis_idx)
+            modes.append(mode)
+            strides.append(stride)
+            dilations.append(dilation)
+
+        if len(set(domain_indices)) != len(domain_indices):
+            raise AxiomShapeError("conv(...): over=... may not reference the same axis more than once.")
+        if feature_idx in domain_indices:
+            raise AxiomShapeError("conv(...): the feature axis may not also appear in over=...")
+
+        if op.pad is not None:
+            if any(mode is not None for mode in modes):
+                raise AxiomShapeError(
+                    "conv(...): do not combine explicit pad= with over-axis modes like same()/valid()/causal()."
+                )
+            padding = self._normalize_explicit_conv_pad(op.pad, spatial_rank)
+        else:
+            padding = self._build_conv_padding(modes, kernel_sizes, dilations)
+
+        return domain_axes, tuple(domain_indices), tuple(strides), tuple(dilations), padding
+
+    def _validate_named_conv_weight(
+            self,
+            weight: "AxiomTensor",
+            kernel_axes,
+            in_axis_name: str,
+            in_features: int,
+            out_axis_name: str,
+            out_features: int,
+            groups,
+    ):
+        if kernel_axes is None:
+            return
+        if groups != 1:
+            # Grouped explicit kernels are still shape-validated by the backend path.
+            return
+        if not isinstance(weight, AxiomTensor):
+            return
+
+        expected_names = [a.name for a in kernel_axes] + [in_axis_name, out_axis_name]
+        actual_names = [a.name for a in weight.axes]
+
+        if actual_names != expected_names:
             raise AxiomShapeError(
-                f"Conv strides rank mismatch: expected {spatial_rank}, got {len(op.strides)}."
+                f"Explicit conv weight axes mismatch: expected {expected_names}, got {actual_names}."
             )
-        if len(op.dilation) != spatial_rank:
+
+        expected_sizes = [int(a.size) for a in kernel_axes] + [int(in_features), int(out_features)]
+        actual_sizes = list(weight.data.shape)
+
+        for name, expected, got in zip(expected_names, expected_sizes, actual_sizes):
+            if expected != got:
+                raise AxiomShapeError(
+                    f"Explicit conv weight axis '{name}' size mismatch: expected {expected}, got {got}."
+                )
+
+    def _run_lax_conv(
+            self,
+            current_data,
+            current_axis_names,
+            feature_idx: int,
+            domain_indices,
+            kernel,
+            kernel_sizes,
+            strides,
+            dilations,
+            padding,
+            groups,
+    ):
+        spatial_rank = len(kernel_sizes)
+        if len(domain_indices) != spatial_rank:
             raise AxiomShapeError(
-                f"Conv dilation rank mismatch: expected {spatial_rank}, got {len(op.dilation)}."
+                f"Internal conv error: got {len(domain_indices)} domain axes for kernel rank {spatial_rank}."
             )
+
+        batch_indices = [i for i in range(current_data.ndim) if i not in domain_indices and i != feature_idx]
+        perm = batch_indices + list(domain_indices) + [feature_idx]
+
+        x = current_data if perm == list(range(current_data.ndim)) else jnp.transpose(current_data, perm)
+
+        batch_shape = tuple(x.shape[:len(batch_indices)])
+        spatial_shape = tuple(x.shape[len(batch_indices):-1])
+
+        if len(spatial_shape) != spatial_rank:
+            raise AxiomShapeError(
+                f"Internal conv error: expected {spatial_rank} spatial dims, got {len(spatial_shape)}."
+            )
+
+        if len(batch_shape) == 0:
+            x = x.reshape((1,) + spatial_shape + (x.shape[-1],))
+        elif len(batch_shape) > 1:
+            x = x.reshape((math.prod(batch_shape),) + spatial_shape + (x.shape[-1],))
 
         in_features = int(x.shape[-1])
-        if in_features % op.groups != 0:
+        groups_resolved = in_features if groups in (-1, "depthwise") else int(groups)
+
+        if in_features % groups_resolved != 0:
             raise AxiomShapeError(
-                f"Conv groups mismatch: input features {in_features} must be divisible by groups={op.groups}."
+                f"Conv groups mismatch: input features {in_features} must be divisible by groups={groups_resolved}."
             )
 
         kernel = jnp.asarray(kernel)
@@ -799,63 +1036,134 @@ class AxiomTensor:
                 f"Conv kernel must have rank {spatial_rank + 2}, got {kernel.ndim}."
             )
 
-        if tuple(kernel.shape[:spatial_rank]) != tuple(op.kernel_size):
+        if tuple(kernel.shape[:spatial_rank]) != tuple(kernel_sizes):
             raise AxiomShapeError(
-                f"Conv kernel shape mismatch: expected spatial kernel {op.kernel_size}, "
+                f"Conv kernel shape mismatch: expected spatial kernel {kernel_sizes}, "
                 f"got {kernel.shape[:spatial_rank]}."
             )
 
-        expected_in_per_group = in_features // op.groups
+        expected_in_per_group = in_features // groups_resolved
         if int(kernel.shape[-2]) != expected_in_per_group:
             raise AxiomShapeError(
                 f"Conv kernel in_features mismatch: expected {expected_in_per_group} "
                 f"(input features per group), got {kernel.shape[-2]}."
             )
 
-        batch_shape = x.shape[: x.ndim - spatial_rank - 1]
-        sample_shape = x.shape[x.ndim - spatial_rank - 1:]
-        original_batch_shape = batch_shape
-
-        if len(batch_shape) == 0:
-            x = x.reshape((1,) + sample_shape)
-        elif len(batch_shape) > 1:
-            x = x.reshape((math.prod(batch_shape),) + sample_shape)
+        out_features = int(kernel.shape[-1])
+        if out_features % groups_resolved != 0:
+            raise AxiomShapeError(
+                f"Conv output features {out_features} must be divisible by groups={groups_resolved}."
+            )
 
         y = jax.lax.conv_general_dilated(
             lhs=x,
             rhs=kernel,
-            window_strides=op.strides,
-            padding=self._normalize_conv_padding(op),
-            rhs_dilation=op.dilation,
+            window_strides=strides,
+            padding=padding,
+            rhs_dilation=dilations,
             dimension_numbers=self._conv_dimension_numbers(spatial_rank),
-            feature_group_count=op.groups,
+            feature_group_count=groups_resolved,
         )
 
-        if len(original_batch_shape) == 0:
+        if len(batch_shape) == 0:
             y = y.reshape(y.shape[1:])
-        elif len(original_batch_shape) > 1:
-            y = y.reshape(original_batch_shape + y.shape[1:])
+        elif len(batch_shape) > 1:
+            y = y.reshape(batch_shape + y.shape[1:])
 
-        out_features = int(kernel.shape[-1])
-        return jnp.moveaxis(y, -1, idx), out_features
+        inv_perm = [0] * len(perm)
+        for canon_idx, orig_idx in enumerate(perm):
+            inv_perm[orig_idx] = canon_idx
 
-    def _apply_explicit_conv(self, current_data, idx: int, op: ConvOp):
-        weight = op.weight.data if isinstance(op.weight, AxiomTensor) else op.weight
-        return self._run_lax_conv(current_data, idx, weight, op)
+        if inv_perm != list(range(len(inv_perm))):
+            y = jnp.transpose(y, inv_perm)
 
-    def _apply_implicit_conv(self, current_data, idx: int, op: ConvOp, out_features: int):
-        in_features = int(current_data.shape[idx])
+        return y, out_features
 
-        if in_features % op.groups != 0:
+    def _apply_explicit_conv(
+            self,
+            current_data,
+            current_axis_names,
+            feature_idx: int,
+            domain_indices,
+            kernel_sizes,
+            kernel_axes,
+            strides,
+            dilations,
+            padding,
+            op: ConvOp,
+            out_axis_name: str,
+    ):
+        if isinstance(op.weight, AxiomTensor):
+            inferred_out = int(op.weight.data.shape[-1])
+            self._validate_named_conv_weight(
+                op.weight,
+                kernel_axes,
+                current_axis_names[feature_idx],
+                int(current_data.shape[feature_idx]),
+                out_axis_name,
+                inferred_out,
+                op.groups,
+            )
+            kernel = op.weight.data
+        else:
+            kernel = op.weight
+
+        return self._run_lax_conv(
+            current_data,
+            current_axis_names,
+            feature_idx,
+            domain_indices,
+            kernel,
+            kernel_sizes,
+            strides,
+            dilations,
+            padding,
+            op.groups,
+        )
+
+    def _apply_implicit_conv(
+            self,
+            current_data,
+            current_axis_names,
+            feature_idx: int,
+            domain_indices,
+            kernel_sizes,
+            strides,
+            dilations,
+            padding,
+            op: ConvOp,
+            out_features: int,
+    ):
+        in_features = int(current_data.shape[feature_idx])
+        groups_resolved = in_features if op.groups in (-1, "depthwise") else int(op.groups)
+
+        if in_features % groups_resolved != 0:
             raise AxiomShapeError(
-                f"Implicit conv groups mismatch: input features {in_features} must be divisible by groups={op.groups}."
+                f"Implicit conv groups mismatch: input features {in_features} "
+                f"must be divisible by groups={groups_resolved}."
+            )
+        if out_features % groups_resolved != 0:
+            raise AxiomShapeError(
+                f"Implicit conv output features {out_features} "
+                f"must be divisible by groups={groups_resolved}."
             )
 
-        kernel_shape = tuple(op.kernel_size) + (in_features // op.groups, out_features)
+        kernel_shape = tuple(kernel_sizes) + (in_features // groups_resolved, out_features)
         k_init = op.kernel_init if op.kernel_init is not None else a_init.default_kernel_init
         kernel = self._get_or_create_param("_axiom_conv_kernel", kernel_shape, k_init)
 
-        return self._run_lax_conv(current_data, idx, kernel, op)
+        return self._run_lax_conv(
+            current_data,
+            current_axis_names,
+            feature_idx,
+            domain_indices,
+            kernel,
+            kernel_sizes,
+            strides,
+            dilations,
+            padding,
+            op.groups,
+        )
 
     def _expand_packed_token_for_rhs(self, token: PackedAxis, physical_size: int):
         known_prod = 1
@@ -917,6 +1225,16 @@ class AxiomTensor:
 
     def _execute_ops(self, current_data, current_axis_names, token, idx):
         current_token = self._strip_runtime_token(token, fallback_size=int(current_data.shape[idx]))
+
+        for op in token.ops:
+            if isinstance(op, (ConvModeOp, ConvStrideOp, ConvDilationOp)):
+                raise AxiomSyntaxError(
+                    "same()/valid()/causal()/stride()/dilate() are conv-domain modifiers "
+                    "and may only be used inside conv(over=...)."
+                )
+
+            if op == "relu":
+                current_data = jax.nn.relu(current_data)
 
         for op in token.ops:
             if op == "relu":
@@ -1334,13 +1652,28 @@ class AxiomTensor:
                 )
 
 
-            elif isinstance(op, ConvOp):
 
-                # Dynamically resolve any symbolic features size right before executing
+            elif isinstance(op, ConvOp):
 
                 size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
 
-                resolved_features = self._resolve_token_sizes(op.features, size_map)
+                resolved_out_axis = self._resolve_token_sizes(op.out_axis, size_map)
+
+                if isinstance(resolved_out_axis, PackedAxis):
+                    raise AxiomShapeError("conv(...): out must be a single Axis, not a PackedAxis.")
+
+                in_features = int(current_data.shape[idx])
+
+                if resolved_out_axis.size is None:
+                    resolved_out_axis = Axis(
+
+                        resolved_out_axis.name,
+
+                        in_features,
+
+                        source_name=resolved_out_axis.source_name,
+
+                    )
 
                 self._check_axis_rename_collision(
 
@@ -1348,20 +1681,55 @@ class AxiomTensor:
 
                     idx,
 
-                    resolved_features.name,
+                    resolved_out_axis.name,
 
                     "conv output",
 
                 )
 
+                kernel_sizes, kernel_axes = self._resolve_conv_kernel(op.kernel, size_map)
+
+                domain_axes, domain_indices, strides, dilations, padding = self._resolve_conv_over(
+
+                    op,
+
+                    current_axis_names,
+
+                    idx,
+
+                    kernel_sizes,
+
+                    size_map,
+
+                )
+
                 if op.weight is None:
 
-                    if resolved_features.size is None:
-                        raise AxiomShapeError("Implicit conv requires an explicit output feature size.")
+                    out_features = int(resolved_out_axis.size)
 
-                    out_features = resolved_features.size
+                    current_data, actual_out = self._apply_implicit_conv(
 
-                    current_data, actual_out = self._apply_implicit_conv(current_data, idx, op, out_features)
+                        current_data,
+
+                        current_axis_names,
+
+                        idx,
+
+                        domain_indices,
+
+                        kernel_sizes,
+
+                        strides,
+
+                        dilations,
+
+                        padding,
+
+                        op,
+
+                        out_features,
+
+                    )
 
                     if actual_out != out_features:
                         raise AxiomShapeError(
@@ -1372,25 +1740,52 @@ class AxiomTensor:
 
                 else:
 
-                    current_data, out_features = self._apply_explicit_conv(current_data, idx, op)
+                    current_data, out_features = self._apply_explicit_conv(
 
-                    if resolved_features.size is None:
+                        current_data,
 
-                        resolved_features.size = out_features
+                        current_axis_names,
 
-                    elif resolved_features.size != out_features:
+                        idx,
 
+                        domain_indices,
+
+                        kernel_sizes,
+
+                        kernel_axes,
+
+                        strides,
+
+                        dilations,
+
+                        padding,
+
+                        op,
+
+                        resolved_out_axis.name,
+
+                    )
+
+                    if resolved_out_axis.size is not None and int(resolved_out_axis.size) != out_features:
                         raise AxiomShapeError(
 
-                            f"Explicit conv output feature mismatch: expected {resolved_features.size}, got {out_features}."
+                            f"Explicit conv output feature mismatch: expected {resolved_out_axis.size}, got {out_features}."
 
                         )
 
-                current_axis_names[idx] = resolved_features.name
+                current_axis_names[idx] = resolved_out_axis.name
 
                 self._assert_unique_names(current_axis_names, "conv output")
 
-                current_token = Axis(resolved_features.name, out_features, source_name=resolved_features.name)
+                current_token = Axis(
+
+                    resolved_out_axis.name,
+
+                    out_features,
+
+                    source_name=resolved_out_axis.name,
+
+                )
 
                 current_data = self._apply_add_bias(
 
@@ -1409,7 +1804,6 @@ class AxiomTensor:
                     param_prefix="_axiom_conv_bias",
 
                 )
-            current_token = self._materialize_token_size(current_token, int(current_data.shape[idx]))
 
         return current_data, current_axis_names, current_token
 

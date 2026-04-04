@@ -33,9 +33,9 @@ def assert_allclose(x, y, atol=1e-5, rtol=1e-5):
 class ImplicitCausalConv1DMod(Module):
     def __call__(self, x):
         return x[..., ax.c.conv(
-            features=ax.cout(1),
-            kernel_size=3,
-            padding="causal",
+            3,
+            over=ax.s.causal(),
+            out=ax.cout(1),
             use_bias=False,
             kernel_init=const_init(1.0),
         )]
@@ -873,9 +873,32 @@ class AxiomRuntimeTests(unittest.TestCase):
         w = jnp.ones((3, 1, 1), dtype=jnp.float32)
 
         y = x[..., ax.c.conv(
-            features=ax.cout(1),
-            kernel_size=3,
-            padding="causal",
+            3,
+            over=ax.s.causal(),
+            out=ax.cout(1),
+            weight=w,
+            use_bias=False,
+        )]
+
+        expected = jnp.array([[[1.0], [3.0], [6.0], [9.0]]], dtype=jnp.float32)
+        assert_axes(self, y, ["b", "s", "cout"], [1, 4, 1])
+        assert_allclose(y.data, expected)
+
+    def test_explicit_conv_1d_causal_named_kernel_axis(self):
+        x = tensor(
+            jnp.array([[[1.0], [2.0], [3.0], [4.0]]], dtype=jnp.float32),
+            ax.b, ax.s, ax.c
+        )
+
+        w = tensor(
+            jnp.ones((3, 1, 1), dtype=jnp.float32),
+            ax.k(3), ax.c, ax.cout(1)
+        )
+
+        y = x[..., ax.c.conv(
+            ax.k(3),
+            over=ax.s.causal(),
+            out=ax.cout(1),
             weight=w,
             use_bias=False,
         )]
@@ -894,10 +917,9 @@ class AxiomRuntimeTests(unittest.TestCase):
         w = jnp.ones((3, 1, 1), dtype=jnp.float32)
 
         y = x[..., ax.c.conv(
-            features=ax.cout(1),
-            kernel_size=3,
-            padding="causal",
-            dilation=2,
+            3,
+            over=ax.s.causal().dilate(2),
+            out=ax.cout(1),
             weight=w,
             use_bias=False,
         )]
@@ -923,10 +945,45 @@ class AxiomRuntimeTests(unittest.TestCase):
         w = jnp.ones((2, 1, 2), dtype=jnp.float32)
 
         y = x[..., ax.c.conv(
-            features=ax.cout(2),
-            kernel_size=2,
-            padding="causal",
+            2,
+            over=ax.s.causal(),
+            out=ax.cout(2),
             groups=2,
+            weight=w,
+            use_bias=False,
+        )]
+
+        expected = jnp.array(
+            [[[1.0, 10.0],
+              [3.0, 30.0],
+              [5.0, 50.0],
+              [7.0, 70.0]]],
+            dtype=jnp.float32
+        )
+
+        assert_axes(self, y, ["b", "s", "cout"], [1, 4, 2])
+        assert_allclose(y.data, expected)
+
+    def test_explicit_conv_1d_causal_depthwise_string_groups(self):
+        x = tensor(
+            jnp.array(
+                [[[1.0, 10.0],
+                  [2.0, 20.0],
+                  [3.0, 30.0],
+                  [4.0, 40.0]]],
+                dtype=jnp.float32
+            ),
+            ax.b, ax.s, ax.c
+        )
+
+        # "depthwise" should resolve to groups=in_features=2
+        w = jnp.ones((2, 1, 2), dtype=jnp.float32)
+
+        y = x[..., ax.c.conv(
+            2,
+            over=ax.s.causal(),
+            out=ax.cout(2),
+            groups="depthwise",
             weight=w,
             use_bias=False,
         )]
@@ -956,59 +1013,76 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_axes(self, y, ["b", "s", "cout"], [1, 4, 1])
         assert_allclose(y.data, expected)
 
-    def test_conv_padding_string_is_case_insensitive(self):
+    def test_conv_same_and_valid_domain_modifiers(self):
         x = tensor(
             jnp.array([[[1.0], [2.0], [3.0], [4.0]]], dtype=jnp.float32),
             ax.b, ax.s, ax.c
         )
         w = jnp.ones((3, 1, 1), dtype=jnp.float32)
 
-        y_lower = x[..., ax.c.conv(
-            features=ax.cout(1),
-            kernel_size=3,
-            padding="causal",
+        y_same = x[..., ax.c.conv(
+            3,
+            over=ax.s.same(),
+            out=ax.cout(1),
             weight=w,
             use_bias=False,
         )]
 
-        y_upper = x[..., ax.c.conv(
-            features=ax.cout(1),
-            kernel_size=3,
-            padding="CAUSAL",
+        y_valid = x[..., ax.c.conv(
+            3,
+            over=ax.s.valid(),
+            out=ax.cout(1),
             weight=w,
             use_bias=False,
         )]
 
-        assert_axes(self, y_lower, ["b", "s", "cout"], [1, 4, 1])
-        assert_axes(self, y_upper, ["b", "s", "cout"], [1, 4, 1])
-        assert_allclose(y_lower.data, y_upper.data)
+        self.assertEqual(y_same.data.shape, (1, 4, 1))
+        self.assertEqual(y_valid.data.shape, (1, 2, 1))
 
-    def test_conv_causal_only_supported_for_1d(self):
+        expected_valid = jnp.array([[[6.0], [9.0]]], dtype=jnp.float32)
+
+        assert_axes(self, y_same, ["b", "s", "cout"], [1, 4, 1])
+        assert_axes(self, y_valid, ["b", "s", "cout"], [1, 2, 1])
+        assert_allclose(y_valid.data, expected_valid)
+
+    def test_conv_axiswise_causal_is_allowed_in_nd(self):
         x = tensor(jnp.ones((1, 4, 4, 1), dtype=jnp.float32), ax.b, ax.h, ax.w, ax.c)
         w = jnp.ones((3, 3, 1, 1), dtype=jnp.float32)
 
-        with self.assertRaises(AxiomShapeError):
-            _ = x[..., ax.c.conv(
-                features=ax.cout(1),
-                kernel_size=(3, 3),
-                padding="causal",
-                weight=w,
-                use_bias=False,
-            )]
+        y = x[..., ax.c.conv(
+            (3, 3),
+            over=ax.h.causal() & ax.w.same(),
+            out=ax.cout(1),
+            weight=w,
+            use_bias=False,
+        )]
+
+        assert_axes(self, y, ["b", "h", "w", "cout"], [1, 4, 4, 1])
 
     def test_conv_groups_mismatch_raises(self):
         x = tensor(jnp.ones((1, 4, 3), dtype=jnp.float32), ax.b, ax.s, ax.c)
 
         with self.assertRaises(AxiomShapeError):
             _ = x[..., ax.c.conv(
-                features=ax.cout(3),
-                kernel_size=3,
-                padding="causal",
+                3,
+                over=ax.s.causal(),
+                out=ax.cout(3),
                 groups=2,   # 3 input channels not divisible by 2
                 weight=jnp.ones((3, 1, 3), dtype=jnp.float32),
                 use_bias=False,
             )]
 
+    def test_conv_domain_modifiers_outside_conv_raise(self):
+        x = tensor(jnp.ones((1, 4, 1), dtype=jnp.float32), ax.b, ax.s, ax.c)
+
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x[ax.b, ax.s.causal(), ax.c]
+
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x[ax.b, ax.s.stride(2), ax.c]
+
+        with self.assertRaises(AxiomSyntaxError):
+            _ = x[ax.b, ax.s.dilate(2), ax.c]
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

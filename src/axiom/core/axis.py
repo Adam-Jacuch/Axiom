@@ -72,6 +72,38 @@ class MaskOp:
     def __repr__(self):
         return f"MaskOp(kind='{self.kind}', other_axis='{self.other_axis}')"
 
+class ConvModeOp:
+    VALID_MODES = ("same", "valid", "causal")
+
+    def __init__(self, mode: str):
+        mode = mode.lower()
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Unknown conv mode '{mode}'.")
+        self.mode = mode
+
+    def __repr__(self):
+        return f"ConvModeOp('{self.mode}')"
+
+
+class ConvStrideOp:
+    def __init__(self, value: int):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("stride(...) expects a positive integer.")
+        self.value = value
+
+    def __repr__(self):
+        return f"ConvStrideOp({self.value})"
+
+
+class ConvDilationOp:
+    def __init__(self, value: int):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError("dilate(...) expects a positive integer.")
+        self.value = value
+
+    def __repr__(self):
+        return f"ConvDilationOp({self.value})"
+
 class ProjOp:
     def __init__(
             self,
@@ -100,56 +132,49 @@ class ProjOp:
 class ConvOp:
     def __init__(
             self,
-            features,
-            kernel_size,
-            strides=None,
-            padding="SAME",
-            use_bias=True,
-            kernel_init=None,
-            bias_init=None,
+            kernel,
+            over=None,
+            out_axis=None,
             weight=None,
             bias=None,
-            dilation=None,
+            use_bias=True,
+            pad=None,
             groups=1,
+            kernel_init=None,
+            bias_init=None,
+            legacy_padding=None,
+            legacy_strides=None,
+            legacy_dilation=None,
     ):
         if bias is not None and use_bias:
             raise ValueError("conv(...): cannot provide explicit bias and also set use_bias=True.")
-        if not isinstance(groups, int) or groups <= 0:
-            raise ValueError("conv(...): groups must be a positive integer.")
 
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size,)
-        if strides is None:
-            strides = (1,) * len(kernel_size)
-        elif isinstance(strides, int):
-            strides = (strides,)
-        if dilation is None:
-            dilation = (1,) * len(kernel_size)
-        elif isinstance(dilation, int):
-            dilation = (dilation,)
+        if groups not in (-1, "depthwise"):
+            if not isinstance(groups, int) or groups <= 0:
+                raise ValueError("conv(...): groups must be a positive integer, -1, or 'depthwise'.")
 
-        if len(strides) != len(kernel_size):
-            raise ValueError("conv(...): strides must have the same rank as kernel_size.")
-        if len(dilation) != len(kernel_size):
-            raise ValueError("conv(...): dilation must have the same rank as kernel_size.")
-
-        self.features = features
-        self.kernel_size = tuple(kernel_size)
-        self.strides = tuple(strides)
-        self.padding = padding
-        self.use_bias = use_bias
-        self.kernel_init = kernel_init
-        self.bias_init = bias_init
+        self.kernel = kernel
+        self.over = over
+        self.out_axis = out_axis
         self.weight = weight
         self.bias = bias
-        self.dilation = tuple(dilation)
+        self.use_bias = use_bias
+        self.pad = pad
         self.groups = groups
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+
+        # Legacy compatibility path
+        self.legacy_padding = legacy_padding
+        self.legacy_strides = legacy_strides
+        self.legacy_dilation = legacy_dilation
 
     def __repr__(self):
+        out_name = getattr(self.out_axis, "name", None)
+        over_name = getattr(self.over, "name", None)
         return (
-            f"ConvOp(kernel_size={self.kernel_size}, strides={self.strides}, "
-            f"dilation={self.dilation}, padding={self.padding}, groups={self.groups}, "
-            f"use_bias={self.use_bias})"
+            f"ConvOp(kernel={self.kernel}, over={over_name}, out={out_name}, "
+            f"groups={self.groups}, use_bias={self.use_bias})"
         )
 
 
@@ -285,15 +310,18 @@ class ScatterOp:
         self.mode = mode
 
 
+def _is_pack_safe_axis_op(op) -> bool:
+    return isinstance(op, (ConvModeOp, ConvStrideOp, ConvDilationOp))
+
+
 def _validate_pack_child(axis):
     if not isinstance(axis, Axis):
         raise TypeError("PackedAxis children must be Axis objects.")
-    if axis.ops:
+    if axis.ops and not all(_is_pack_safe_axis_op(op) for op in axis.ops):
         raise ValueError(
-            f"Cannot pack axis '{axis.name}' because it already carries ops. "
+            f"Cannot pack axis '{axis.name}' because it already carries non-packable ops. "
             f"Apply ops before or after packing, not on child axes inside a pack."
         )
-
 
 def _validate_pack_operand(obj):
     if isinstance(obj, PackedAxis):
@@ -500,6 +528,31 @@ class PackedAxis:
     def scatter(self, indices, updates, mode="update"):
         return self._spawn(list(self.ops) + [ScatterOp(indices, updates, mode)])
 
+    def _map_conv_meta(self, method_name, *args, **kwargs):
+        if self.ops:
+            raise ValueError(
+                f"Cannot apply conv-domain modifiers to PackedAxis('{self.name}') "
+                f"because it already carries packed ops."
+            )
+        return PackedAxis(*[
+            getattr(a, method_name)(*args, **kwargs) for a in self.axes
+        ])
+
+    def same(self):
+        return self._map_conv_meta("same")
+
+    def valid(self):
+        return self._map_conv_meta("valid")
+
+    def causal(self):
+        return self._map_conv_meta("causal")
+
+    def stride(self, n: int):
+        return self._map_conv_meta("stride", n)
+
+    def dilate(self, n: int):
+        return self._map_conv_meta("dilate", n)
+
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
 
@@ -588,35 +641,81 @@ class Axis:
 
     def conv(
             self,
-            features,
-            kernel_size,
-            strides=None,
-            padding="SAME",
-            use_bias=True,
-            kernel_init=None,
-            bias_init=None,
+            kernel=None,
+            *,
+            over=None,
+            out=None,
+            groups=1,
             weight=None,
             bias=None,
+            use_bias=True,
+            pad=None,
+            kernel_init=None,
+            bias_init=None,
+            # legacy sugar
+            features=None,
+            kernel_size=None,
+            strides=None,
+            padding=None,
             dilation=None,
-            groups=1,
     ):
-        out_axis = features if isinstance(features, Axis) else Axis(self.name, features)
-        new_ops = list(self.ops) + [
-            ConvOp(
-                out_axis,
-                kernel_size,
-                strides=strides,
-                padding=padding,
-                use_bias=use_bias,
-                kernel_init=kernel_init,
-                bias_init=bias_init,
+        using_legacy = any(v is not None for v in (features, kernel_size, strides, padding, dilation))
+
+        base_self = Axis(self.name, self.size, source_name=self.source_name)
+
+        if using_legacy:
+            if kernel is not None or over is not None or out is not None or pad is not None:
+                raise ValueError(
+                    "conv(...): do not mix legacy arguments "
+                    "(features/kernel_size/strides/padding/dilation) with canonical arguments "
+                    "(kernel/over/out/pad)."
+                )
+            if kernel_size is None:
+                raise ValueError("conv(...): legacy form requires kernel_size=...")
+
+            out_axis = base_self if features is None else (
+                features if isinstance(features, Axis) else Axis(self.name, features)
+            )
+
+            op = ConvOp(
+                kernel=kernel_size,
+                over=None,
+                out_axis=out_axis,
                 weight=weight,
                 bias=bias,
-                dilation=dilation,
+                use_bias=use_bias,
+                pad=None,
                 groups=groups,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                legacy_padding=padding,
+                legacy_strides=strides,
+                legacy_dilation=dilation,
             )
-        ]
-        return Axis(self.name, self.size, new_ops, self.source_name)
+        else:
+            if kernel is None:
+                raise ValueError("conv(...): canonical form requires kernel.")
+            if over is None:
+                raise ValueError("conv(...): canonical form requires over=...")
+
+            out_axis = base_self if out is None else (
+                out if isinstance(out, Axis) else Axis(self.name, out)
+            )
+
+            op = ConvOp(
+                kernel=kernel,
+                over=over,
+                out_axis=out_axis,
+                weight=weight,
+                bias=bias,
+                use_bias=use_bias,
+                pad=pad,
+                groups=groups,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+            )
+
+        return self._spawn(list(self.ops) + [op])
 
     def bias(self, tensor=None, init_fn=None):
         return Axis(
@@ -838,6 +937,29 @@ class Axis:
 
     def all(self) -> ConsumedSlot: return ConsumedSlot(self.name, "all",
                                                        source_name=getattr(self, "source_name", self.name))
+
+    def _spawn(self, ops=None, size=None):
+        return self.__class__(
+            self.name,
+            self.size if size is None else size,
+            list(self.ops if ops is None else ops),
+            self.source_name,
+        )
+
+    def same(self):
+        return self._spawn(list(self.ops) + [ConvModeOp("same")])
+
+    def valid(self):
+        return self._spawn(list(self.ops) + [ConvModeOp("valid")])
+
+    def causal(self):
+        return self._spawn(list(self.ops) + [ConvModeOp("causal")])
+
+    def stride(self, n: int):
+        return self._spawn(list(self.ops) + [ConvStrideOp(n)])
+
+    def dilate(self, n: int):
+        return self._spawn(list(self.ops) + [ConvDilationOp(n)])
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"
