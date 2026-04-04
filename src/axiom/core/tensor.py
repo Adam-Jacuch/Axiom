@@ -1654,155 +1654,91 @@ class AxiomTensor:
 
 
             elif isinstance(op, ConvOp):
-
                 size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
-
                 resolved_out_axis = self._resolve_token_sizes(op.out_axis, size_map)
 
                 if isinstance(resolved_out_axis, PackedAxis):
                     raise AxiomShapeError("conv(...): out must be a single Axis, not a PackedAxis.")
 
                 in_features = int(current_data.shape[idx])
-
                 if resolved_out_axis.size is None:
                     resolved_out_axis = Axis(
-
                         resolved_out_axis.name,
-
                         in_features,
-
                         source_name=resolved_out_axis.source_name,
-
                     )
 
                 self._check_axis_rename_collision(
-
                     current_axis_names,
-
                     idx,
-
                     resolved_out_axis.name,
-
                     "conv output",
-
                 )
 
                 kernel_sizes, kernel_axes = self._resolve_conv_kernel(op.kernel, size_map)
-
                 domain_axes, domain_indices, strides, dilations, padding = self._resolve_conv_over(
-
                     op,
-
                     current_axis_names,
-
                     idx,
-
                     kernel_sizes,
-
                     size_map,
-
                 )
 
                 if op.weight is None:
-
                     out_features = int(resolved_out_axis.size)
-
                     current_data, actual_out = self._apply_implicit_conv(
-
                         current_data,
-
                         current_axis_names,
-
                         idx,
-
                         domain_indices,
-
                         kernel_sizes,
-
                         strides,
-
                         dilations,
-
                         padding,
-
                         op,
-
                         out_features,
-
                     )
 
                     if actual_out != out_features:
                         raise AxiomShapeError(
-
                             f"Implicit conv internal mismatch: expected {out_features} output features, got {actual_out}."
-
                         )
-
                 else:
-
                     current_data, out_features = self._apply_explicit_conv(
-
                         current_data,
-
                         current_axis_names,
-
                         idx,
-
                         domain_indices,
-
                         kernel_sizes,
-
                         kernel_axes,
-
                         strides,
-
                         dilations,
-
                         padding,
-
                         op,
-
                         resolved_out_axis.name,
-
                     )
 
                     if resolved_out_axis.size is not None and int(resolved_out_axis.size) != out_features:
                         raise AxiomShapeError(
-
                             f"Explicit conv output feature mismatch: expected {resolved_out_axis.size}, got {out_features}."
-
                         )
 
                 current_axis_names[idx] = resolved_out_axis.name
-
                 self._assert_unique_names(current_axis_names, "conv output")
-
                 current_token = Axis(
-
                     resolved_out_axis.name,
-
                     out_features,
-
                     source_name=resolved_out_axis.name,
-
                 )
 
                 current_data = self._apply_add_bias(
-
                     current_data,
-
                     current_axis_names,
-
                     idx,
-
                     explicit_bias=op.bias,
-
                     use_implicit=(op.bias is None and op.use_bias),
-
                     init_fn=op.bias_init,
-
                     param_prefix="_axiom_conv_bias",
-
                 )
 
         return current_data, current_axis_names, current_token
