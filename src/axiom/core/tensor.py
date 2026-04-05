@@ -1464,18 +1464,37 @@ class AxiomTensor:
                     )
 
 
+
             elif isinstance(op, DropoutOp):
+
                 active_mod = self._require_active_module("Dropout")
-                param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
+
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
-                if not getattr(active_mod, "_axiom_initialized", False):
-                    # THE CRITICAL FIX: dropout=seed, NOT params=seed
-                    seed = id(active_mod) + active_mod._axiom_param_counter
-                    setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=nnx.Rngs(dropout=seed)))
+                if op.rate > 0.0:
+                    # THE MINIMAL REMAT-SAFE FIX: Endogenous Functional Dropout
 
-                drop_layer = getattr(active_mod, param_name)
-                current_data = drop_layer(current_data)
+                    # We bypass nnx.Dropout and RngCount mutation entirely.
+
+                    # By hashing the tensor's own geometry, the dropout changes every step
+
+                    # but remains 100% perfectly deterministic for the remat backward pass!
+
+                    static_seed = id(active_mod) + active_mod._axiom_param_counter
+
+                    key = jax.random.key(static_seed)
+
+                    # Stop gradient ensures this hash doesn't mess with backprop
+
+                    dynamic_seed = jax.lax.stop_gradient(jnp.sum(current_data * 1000).astype(jnp.int32))
+
+                    key = jax.random.fold_in(key, dynamic_seed)
+
+                    keep_prob = 1.0 - op.rate
+
+                    mask = jax.random.bernoulli(key, keep_prob, current_data.shape)
+
+                    current_data = jnp.where(mask, current_data / keep_prob, jnp.zeros_like(current_data))
 
 
             elif isinstance(op, ScanOp):
