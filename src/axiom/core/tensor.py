@@ -151,6 +151,7 @@ class AxiomTensor:
         object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
         if not getattr(active_mod, "_axiom_initialized", False):
+            seed = id(active_mod) + active_mod._axiom_param_counter
             e_dtype = dtype if dtype is not None else jnp.float32
             setattr(
                 active_mod,
@@ -160,7 +161,7 @@ class AxiomTensor:
                     features=out.size,
                     dtype=e_dtype,
                     param_dtype=e_dtype,
-                    rngs=context.get_rngs(),
+                    rngs=nnx.Rngs(params=seed),  # Private RNG
                 ),
             )
 
@@ -472,7 +473,9 @@ class AxiomTensor:
         object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
         if not getattr(active_mod, "_axiom_initialized", False):
-            rng = context.get_rngs().params()
+            # Private RNG for params
+            seed = id(active_mod) + active_mod._axiom_param_counter
+            rng = nnx.Rngs(params=seed).params()
             setattr(active_mod, param_name, nnx.Param(init_fn(rng, shape)))
 
         param = getattr(active_mod, param_name)
@@ -1460,13 +1463,16 @@ class AxiomTensor:
                         param_prefix="_axiom_norm_bias",
                     )
 
+
             elif isinstance(op, DropoutOp):
                 active_mod = self._require_active_module("Dropout")
                 param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
                 if not getattr(active_mod, "_axiom_initialized", False):
-                    setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=context.get_rngs()))
+                    # THE CRITICAL FIX: dropout=seed, NOT params=seed
+                    seed = id(active_mod) + active_mod._axiom_param_counter
+                    setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=nnx.Rngs(dropout=seed)))
 
                 drop_layer = getattr(active_mod, param_name)
                 current_data = drop_layer(current_data)
@@ -1597,6 +1603,7 @@ class AxiomTensor:
                     object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
                     if not getattr(active_mod, "_axiom_initialized", False):
+                        seed = id(active_mod) + active_mod._axiom_param_counter
                         k_init = op.kernel_init if op.kernel_init is not None else a_init.default_kernel_init
                         p_dtype = op.dtype if op.dtype is not None else jnp.float32
                         setattr(
@@ -1609,7 +1616,7 @@ class AxiomTensor:
                                 kernel_init=k_init,
                                 dtype=p_dtype,
                                 param_dtype=p_dtype,
-                                rngs=context.get_rngs(),
+                                rngs=nnx.Rngs(params=seed),  # Private RNG
                             ),
                         )
 
