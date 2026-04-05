@@ -1463,73 +1463,39 @@ class AxiomTensor:
                         param_prefix="_axiom_norm_bias",
                     )
 
-
-
             elif isinstance(op, DropoutOp):
-
                 active_mod = self._require_active_module("Dropout")
-
+                param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
-                if op.rate > 0.0:
-                    # THE MINIMAL REMAT-SAFE FIX: Endogenous Functional Dropout
+                if not getattr(active_mod, "_axiom_initialized", False):
+                    # Use our remat-safe dropout! No Rngs tracking needed.
+                    setattr(active_mod, param_name, AxiomDropout(rate=op.rate))
 
-                    # We bypass nnx.Dropout and RngCount mutation entirely.
-
-                    # By hashing the tensor's own geometry, the dropout changes every step
-
-                    # but remains 100% perfectly deterministic for the remat backward pass!
-
-                    static_seed = id(active_mod) + active_mod._axiom_param_counter
-
-                    key = jax.random.key(static_seed)
-
-                    # Stop gradient ensures this hash doesn't mess with backprop
-
-                    dynamic_seed = jax.lax.stop_gradient(jnp.sum(current_data * 1000).astype(jnp.int32))
-
-                    key = jax.random.fold_in(key, dynamic_seed)
-
-                    keep_prob = 1.0 - op.rate
-
-                    mask = jax.random.bernoulli(key, keep_prob, current_data.shape)
-
-                    current_data = jnp.where(mask, current_data / keep_prob, jnp.zeros_like(current_data))
-
+                drop_layer = getattr(active_mod, param_name)
+                current_data = drop_layer(current_data)
 
             elif isinstance(op, ScanOp):
-
                 scan_main = jnp.swapaxes(current_data, 0, idx)
-
                 scan_extras = []
 
                 for extra in op.inputs:
                     extra_names = [a.name for a in extra.axes]
-
                     e_idx = extra_names.index(current_token.name)
-
                     scan_extras.append(jnp.swapaxes(extra.data, 0, e_idx))
 
                 # Handle the explicit initialization state
-
                 if op.init is not None:
-
                     init_state = op.init.data if hasattr(op.init, "data") else op.init
-
                 else:
-
                     init_state = jnp.zeros_like(scan_main[0])
 
                 def scan_body(carry, xs):
-
                     new_state, out_y = op.fn(carry, (xs[0], *xs[1:]))
-
                     new_state = new_state.astype(carry.dtype)
-
                     return new_state, out_y
 
                 _, scanned_out = jax.lax.scan(scan_body, init_state, (scan_main, *scan_extras))
-
                 current_data = jnp.swapaxes(scanned_out, 0, idx)
 
             elif isinstance(op, AttendOp):
@@ -1968,3 +1934,29 @@ class AxiomTensor:
             return AxiomTensor(final_data, self._finalize_output_axes(final_tokens, final_data))
 
         return AxiomTensor(current_data, self._finalize_output_axes(surviving_tokens, current_data))
+
+
+class AxiomDropout(nnx.Module):
+    """A mathematically perfect, remat-safe implementation of Dropout."""
+
+    def __init__(self, rate: float, deterministic: bool = False):
+        self.rate = rate
+        self.deterministic = deterministic
+
+        # Allocate a uniquely seeded base PRNG key for this specific layer
+        self.base_key = nnx.Param(jax.random.key(id(self)))
+
+        # A standard variable counter initialized as a JAX array
+        self.step = nnx.Variable(jnp.array(0))
+
+    def __call__(self, x):
+        # Turns off automatically if rate is 0 or if flagged for eval!
+        if self.rate == 0.0 or self.deterministic:
+            return x
+
+        key = jax.random.fold_in(self.base_key[...], self.step[...])
+        self.step[...] += 1
+
+        keep_prob = 1.0 - self.rate
+        mask = jax.random.bernoulli(key, keep_prob, x.shape)
+        return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
