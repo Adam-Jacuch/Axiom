@@ -16,6 +16,15 @@ class _ModuleContext:
     def get_active(self):
         return self.stack[-1] if self.stack else None
 
+    def get_rngs(self):
+        # 1. Check if the root Model has an explicit 'rngs' attached
+        if self.stack and hasattr(self.stack[0], 'rngs'):
+            return self.stack[0].rngs
+        # 2. Fallback to an implicit shared global RNG
+        if not hasattr(self._local, "rngs"):
+            self._local.rngs = nnx.Rngs(params=0, dropout=1)
+        return self._local.rngs
+
 
 context = _ModuleContext()
 

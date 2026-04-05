@@ -160,7 +160,7 @@ class AxiomTensor:
                     features=out.size,
                     dtype=e_dtype,
                     param_dtype=e_dtype,
-                    rngs=nnx.Rngs(0),
+                    rngs=context.get_rngs(),
                 ),
             )
 
@@ -472,7 +472,7 @@ class AxiomTensor:
         object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
         if not getattr(active_mod, "_axiom_initialized", False):
-            rng = nnx.Rngs(0)()
+            rng = context.get_rngs().params()
             setattr(active_mod, param_name, nnx.Param(init_fn(rng, shape)))
 
         param = getattr(active_mod, param_name)
@@ -1466,7 +1466,7 @@ class AxiomTensor:
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
                 if not getattr(active_mod, "_axiom_initialized", False):
-                    setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=nnx.Rngs(dropout=0)))
+                    setattr(active_mod, param_name, nnx.Dropout(rate=op.rate, rngs=context.get_rngs()))
 
                 drop_layer = getattr(active_mod, param_name)
                 current_data = drop_layer(current_data)
@@ -1609,7 +1609,7 @@ class AxiomTensor:
                                 kernel_init=k_init,
                                 dtype=p_dtype,
                                 param_dtype=p_dtype,
-                                rngs=nnx.Rngs(0),
+                                rngs=context.get_rngs(),
                             ),
                         )
 
