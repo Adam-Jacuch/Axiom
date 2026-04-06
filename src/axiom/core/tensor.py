@@ -1465,19 +1465,15 @@ class AxiomTensor:
 
             elif isinstance(op, DropoutOp):
                 active_mod = self._require_active_module("Dropout")
-                base_seed = id(active_mod) + active_mod._axiom_param_counter
+                param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
-                if op.rate > 0.0:
-                    first_val = current_data.reshape(-1)[0]
-                    dynamic_seed = jax.lax.stop_gradient(jnp.abs(first_val * 100000.0).astype(jnp.uint32))
+                if not getattr(active_mod, "_axiom_initialized", False):
+                    # Native assignment of our custom remat-safe class
+                    setattr(active_mod, param_name, AxiomDropout(rate=op.rate))
 
-                    key = jax.random.key(base_seed)
-                    key = jax.random.fold_in(key, dynamic_seed)
-
-                    keep_prob = 1.0 - op.rate
-                    mask = jax.random.bernoulli(key, keep_prob, current_data.shape)
-                    current_data = jnp.where(mask, current_data / keep_prob, jnp.zeros_like(current_data))
+                drop_layer = getattr(active_mod, param_name)
+                current_data = drop_layer(current_data)
 
             elif isinstance(op, ScanOp):
                 scan_main = jnp.swapaxes(current_data, 0, idx)
@@ -1938,3 +1934,27 @@ class AxiomTensor:
             return AxiomTensor(final_data, self._finalize_output_axes(final_tokens, final_data))
 
         return AxiomTensor(current_data, self._finalize_output_axes(surviving_tokens, current_data))
+
+
+class AxiomDropout(nnx.Module):
+    """A truly random, mathematically pure, remat-safe Dropout layer."""
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.deterministic = False  # Standard NNX toggle pattern
+        self.layer_id = id(self)
+
+    def __call__(self, x):
+        if self.rate == 0.0 or self.deterministic:
+            return x
+
+        step_key = context.step_key
+        if step_key is None:
+            step_key = jax.random.key(0)  # Safety fallback
+
+        # Fold in the layer's unique ID so no two layers share the same mask
+        key = jax.random.fold_in(step_key, self.layer_id)
+
+        keep_prob = 1.0 - self.rate
+        mask = jax.random.bernoulli(key, keep_prob, x.shape)
+        return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
