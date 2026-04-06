@@ -1465,15 +1465,19 @@ class AxiomTensor:
 
             elif isinstance(op, DropoutOp):
                 active_mod = self._require_active_module("Dropout")
-                param_name = f"_axiom_drop_{active_mod._axiom_param_counter}"
+                base_seed = id(active_mod) + active_mod._axiom_param_counter
                 object.__setattr__(active_mod, '_axiom_param_counter', active_mod._axiom_param_counter + 1)
 
-                if not getattr(active_mod, "_axiom_initialized", False):
-                    # Use our remat-safe dropout! No Rngs tracking needed.
-                    setattr(active_mod, param_name, AxiomDropout(rate=op.rate))
+                if op.rate > 0.0:
+                    first_val = current_data.reshape(-1)[0]
+                    dynamic_seed = jax.lax.stop_gradient(jnp.abs(first_val * 100000.0).astype(jnp.uint32))
 
-                drop_layer = getattr(active_mod, param_name)
-                current_data = drop_layer(current_data)
+                    key = jax.random.key(base_seed)
+                    key = jax.random.fold_in(key, dynamic_seed)
+
+                    keep_prob = 1.0 - op.rate
+                    mask = jax.random.bernoulli(key, keep_prob, current_data.shape)
+                    current_data = jnp.where(mask, current_data / keep_prob, jnp.zeros_like(current_data))
 
             elif isinstance(op, ScanOp):
                 scan_main = jnp.swapaxes(current_data, 0, idx)
@@ -1934,30 +1938,3 @@ class AxiomTensor:
             return AxiomTensor(final_data, self._finalize_output_axes(final_tokens, final_data))
 
         return AxiomTensor(current_data, self._finalize_output_axes(surviving_tokens, current_data))
-
-
-class AxiomDropout(nnx.Module):
-    """A mathematically perfect, remat-safe implementation of Dropout."""
-
-    def __init__(self, rate: float, deterministic: bool = False):
-        self.rate = rate
-        self.deterministic = deterministic
-
-        # THE FIX: Use nnx.Variable instead of nnx.Param!
-        # We do NOT want to compute gradients for a random seed integer.
-        self.base_key = nnx.Variable(jax.random.key(id(self)))
-
-        # A standard variable counter initialized as a JAX array
-        self.step = nnx.Variable(jnp.array(0))
-
-    def __call__(self, x):
-        # Turns off automatically if rate is 0 or if flagged for eval!
-        if self.rate == 0.0 or self.deterministic:
-            return x
-
-        key = jax.random.fold_in(self.base_key[...], self.step[...])
-        self.step[...] += 1
-
-        keep_prob = 1.0 - self.rate
-        mask = jax.random.bernoulli(key, keep_prob, x.shape)
-        return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
