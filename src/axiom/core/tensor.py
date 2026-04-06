@@ -1942,7 +1942,7 @@ class AxiomDropout(nnx.Module):
     def __init__(self, rate: float):
         self.rate = rate
         self.deterministic = False  # Standard NNX toggle pattern
-        self.layer_id = id(self)
+        self.layer_id = id(self) & 0xFFFFFFFF
 
     def __call__(self, x):
         if self.rate == 0.0 or self.deterministic:
