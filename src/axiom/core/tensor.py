@@ -1943,8 +1943,9 @@ class AxiomDropout(nnx.Module):
         self.rate = rate
         self.deterministic = deterministic
 
-        # Allocate a uniquely seeded base PRNG key for this specific layer
-        self.base_key = nnx.Param(jax.random.key(id(self)))
+        # THE FIX: Use nnx.Variable instead of nnx.Param!
+        # We do NOT want to compute gradients for a random seed integer.
+        self.base_key = nnx.Variable(jax.random.key(id(self)))
 
         # A standard variable counter initialized as a JAX array
         self.step = nnx.Variable(jnp.array(0))
