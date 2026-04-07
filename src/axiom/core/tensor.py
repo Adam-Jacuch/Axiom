@@ -1258,6 +1258,9 @@ class AxiomTensor:
             elif op == "softmax":
                 current_data = jax.nn.softmax(current_data, axis=idx)
 
+            elif op == "softplus":
+                current_data = jax.nn.softplus(current_data)
+
             # --- Phase 1: Pointwise ---
             elif op == "exp":
                 current_data = jnp.exp(current_data)

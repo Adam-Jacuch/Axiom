@@ -511,6 +511,9 @@ class PackedAxis:
     def softmax(self):
         return self._spawn(list(self.ops) + ["softmax"])
 
+    def softplus(self):
+        return self._spawn(list(self.ops) + ["softplus"])
+
     # --- Phase 1: Pointwise ---
     def clamp(self, min=None, max=None):
         return self._spawn(list(self.ops) + [ClampOp(min_val=min, max_val=max)])
@@ -887,6 +890,9 @@ class Axis:
 
     def softmax(self):
         return Axis(self.name, self.size, list(self.ops) + ["softmax"], self.source_name)
+
+    def softplus(self):
+        return Axis(self.name, self.size, list(self.ops) + ["softplus"], self.source_name)
 
     def sum(self) -> ConsumedSlot:
         return ConsumedSlot(self.name, "sum", source_name=getattr(self, "source_name", self.name))

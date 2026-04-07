@@ -419,6 +419,7 @@ class AxiomRuntimeTests(unittest.TestCase):
             ("sigmoid", jax.nn.sigmoid(x.data)),
             ("tanh", jnp.tanh(x.data)),
             ("softmax", jax.nn.softmax(x.data, axis=-1)),
+            ("softplus", jax.nn.softplus(x.data)),
         ]
 
         for op_name, expected in cases:
