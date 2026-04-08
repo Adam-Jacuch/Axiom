@@ -1279,5 +1279,105 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_axes(self, f, ["b", "d"], [2, 3])
         assert_allclose(f.data, jnp.full((2, 3), 9.9))
 
+    # -------------------------------------------------------------------------
+    # UnfoldOp & Explicit Convolution Tests
+    # -------------------------------------------------------------------------
+
+    def test_basic_1d_unfold(self):
+        # Shape: [batch=2, seq=10, channels=1]
+        # Data: 0 to 9 so we can visually track the windows
+        data = jnp.arange(10, dtype=jnp.float32).reshape(1, 10, 1).repeat(2, axis=0)
+        x = tensor(data, ax.b, ax.seq, ax.c)
+
+        # Unfold with window=3, stride=1
+        # Expected output sequence length = (10 - 3) // 1 + 1 = 8
+        y = x[ax.b, ax.seq.unfold(window=3, out=ax.seq_out & ax.win), ax.c]
+
+        assert_axes(self, y, ["b", "seq_out", "win", "c"], [2, 8, 3, 1])
+
+        # Verify the actual overlapping patches were extracted correctly
+        # The first window of the first batch should be [0, 1, 2]
+        self.assertEqual(y.data[0, 0, 0, 0], 0.0)
+        self.assertEqual(y.data[0, 0, 1, 0], 1.0)
+        self.assertEqual(y.data[0, 0, 2, 0], 2.0)
+
+        # The second window should slide by 1: [1, 2, 3]
+        self.assertEqual(y.data[0, 1, 0, 0], 1.0)
+        self.assertEqual(y.data[0, 1, 2, 0], 3.0)
+
+    def test_2d_im2col_unfold(self):
+        # Shape: [batch=2, height=16, width=16, channels=3]
+        x = tensor(jnp.zeros((2, 16, 16, 3), dtype=jnp.float32), ax.b, ax.h, ax.w, ax.c)
+
+        # Unfold both spatial dimensions with 3x3 windows
+        # Expected spatial out = (16 - 3) // 1 + 1 = 14
+        y = x[
+            ax.b,
+            ax.h.unfold(window=3, out=ax.h_out & ax.wh),
+            ax.w.unfold(window=3, out=ax.w_out & ax.ww),
+            ax.c
+        ]
+
+        # The rank explodes to 6 precisely as requested!
+        assert_axes(self, y, ["b", "h_out", "wh", "w_out", "ww", "c"], [2, 14, 3, 14, 3, 3])
+
+    def test_unfold_with_strides_and_dilation(self):
+        x = tensor(jnp.zeros((2, 20, 1), dtype=jnp.float32), ax.b, ax.seq, ax.c)
+
+        # Stride=2: (20 - 3) // 2 + 1 = 9
+        y_stride = x[ax.b, ax.seq.unfold(window=3, stride=2, out=ax.seq_out & ax.win), ax.c]
+        assert_axes(self, y_stride, ["b", "seq_out", "win", "c"], [2, 9, 3, 1])
+
+        # Dilation=2: effective window = (3 - 1) * 2 + 1 = 5
+        # Out seq = (20 - 5) // 1 + 1 = 16
+        y_dilate = x[ax.b, ax.seq.unfold(window=3, dilation=2, out=ax.seq_out & ax.win), ax.c]
+        assert_axes(self, y_dilate, ["b", "seq_out", "win", "c"], [2, 16, 3, 1])
+
+    def test_pad_then_unfold_equivalence(self):
+        # Demonstrating how to achieve "same" padding manually
+        x = tensor(jnp.zeros((2, 16, 4), dtype=jnp.float32), ax.b, ax.seq, ax.c)
+
+        # 1. Pad 1 on the left, 1 on the right. Sequence becomes 18.
+        # 2. Unfold with window 3. Out seq = (18 - 3) // 1 + 1 = 16.
+        y = x[ax.b, ax.seq.pad((1, 1)).unfold(window=3, out=ax.seq_out & ax.win), ax.c]
+
+        assert_axes(self, y, ["b", "seq_out", "win", "c"], [2, 16, 3, 4])
+
+    def test_full_explicit_convolution(self):
+        from axiom import Module
+
+        # 1. Define the operation inside a Module so Axiom can track the implicit weights!
+        class ExplicitConvLayer(Module):
+            def __call__(self, x):
+                return x[
+                    ax.b, ax.seq.pad((1, 1)).unfold(window=3, out=ax.seq_out & ax.win), ax.c,
+                    "->",
+                    ax.b, ax.seq_out, (ax.win & ax.c).proj(out=ax.cout(8))
+                ]
+
+        x = tensor(jnp.zeros((2, 16, 4), dtype=jnp.float32), ax.b, ax.seq, ax.c)
+
+        # 2. Instantiate and run
+        layer = ExplicitConvLayer()
+        y = layer(x)
+
+        assert_axes(self, y, ["b", "seq_out", "cout"], [2, 16, 8])
+
+    def test_unfold_guardrails(self):
+        x = tensor(jnp.zeros((2, 10, 1), dtype=jnp.float32), ax.b, ax.seq, ax.c)
+
+        # Fails: out_axes must be a PackedAxis of exactly two axes
+        with self.assertRaises(ValueError):
+            _ = x[ax.b, ax.seq.unfold(window=3, out=ax.seq_out), ax.c]
+
+        with self.assertRaises(ValueError):
+            _ = x[ax.b, ax.seq.unfold(window=3, out=ax.seq_out & ax.win & ax.extra), ax.c]
+
+        # Fails: Window is larger than the tensor sequence (12 > 10)
+        with self.assertRaises(AxiomShapeError) as context:
+            _ = x[ax.b, ax.seq.unfold(window=12, out=ax.seq_out & ax.win), ax.c]
+
+        self.assertIn("Tensor is too small", str(context.exception))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

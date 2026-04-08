@@ -104,6 +104,20 @@ class ConvDilationOp:
     def __repr__(self):
         return f"ConvDilationOp({self.value})"
 
+class UnfoldOp:
+    def __init__(self, window: int, out_axes, stride: int = 1, dilation: int = 1):
+        self.window = window
+        self.stride = stride
+        self.dilation = dilation
+        self.out_axes = out_axes
+
+        if not hasattr(self.out_axes, "axes") or len(self.out_axes.axes) != 2:
+            raise ValueError(
+                "unfold(out=...) must receive a PackedAxis with exactly two axes (e.g., ax.seq_out & ax.window).")
+
+    def __repr__(self):
+        return f"UnfoldOp(window={self.window}, out={self.out_axes.name})"
+
 class ProjOp:
     def __init__(
             self,
@@ -802,6 +816,9 @@ class Axis:
             )
 
         return self._spawn(list(self.ops) + [op])
+
+    def unfold(self, window: int, out, stride: int = 1, dilation: int = 1):
+        return self._spawn(list(self.ops) + [UnfoldOp(window, out, stride, dilation)])
 
     def bias(self, tensor=None, init_fn=None):
         return Axis(

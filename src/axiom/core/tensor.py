@@ -12,7 +12,7 @@ from .axis import (
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
     ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
-    ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp, PoolOp, AssertOp,
+    ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp, PoolOp, AssertOp, UnfoldOp,
 )
 from .module import context
 from .. import init as a_init
@@ -1409,6 +1409,58 @@ class AxiomTensor:
                 # The active routing chain continues with the primary tensor (x_out)
                 current_data = scanned_out[0]
 
+
+            elif isinstance(op, UnfoldOp):
+                if op is not token.ops[-1]:
+                    raise AxiomSyntaxError(
+                        "unfold() must be the final operation in a chain because it splits the axis.")
+
+                seq_name = current_token.name
+                seq_len = int(current_data.shape[idx])
+
+                effective_window = (op.window - 1) * op.dilation + 1
+                out_seq_len = (seq_len - effective_window) // op.stride + 1
+
+                if out_seq_len <= 0:
+                    raise AxiomShapeError(
+                        f"Cannot unfold axis '{seq_name}' (size {seq_len}) with window {op.window}. "
+                        "Tensor is too small or padding is missing."
+                    )
+
+                moved = jnp.moveaxis(current_data, idx, -1)
+                flat_batch_size = math.prod(moved.shape[:-1]) if moved.ndim > 1 else 1
+                reshaped_for_patches = jnp.reshape(moved, (flat_batch_size, seq_len, 1))
+
+                # 1. Use the standard tuple format for 1D convolution dimension numbers
+                # (batch, feature, spatial)
+                dim_nums = jax.lax.ConvDimensionNumbers((0, 2, 1), (2, 1, 0), (0, 2, 1))
+
+                patches = jax.lax.conv_general_dilated_patches(
+                    lhs=reshaped_for_patches,
+                    filter_shape=(op.window,),
+                    window_strides=(op.stride,),
+                    padding="VALID",
+                    rhs_dilation=(op.dilation,),
+                    dimension_numbers=dim_nums
+                )
+
+                restored_shape = moved.shape[:-1] + (out_seq_len, op.window)
+                patches = jnp.reshape(patches, restored_shape)
+
+                # Insert the newly created axes back where the original axis was
+                current_data = jnp.moveaxis(patches, (-2, -1), (idx, idx + 1))
+
+                ax_seq_out, ax_win = op.out_axes.axes
+                ax_seq_out = Axis(ax_seq_out.name, out_seq_len, source_name=ax_seq_out.name)
+                ax_win = Axis(ax_win.name, op.window, source_name=ax_win.name)
+
+                # Return them as a tuple so the router knows the rank expanded
+                current_token = (ax_seq_out, ax_win)
+
+                current_axis_names.pop(idx)
+                current_axis_names.insert(idx, ax_seq_out.name)
+                current_axis_names.insert(idx + 1, ax_win.name)
+
             # --- Phase 3: Control & Scatter ---
             elif isinstance(op, StopGradientOp):
                 current_data = jax.lax.stop_gradient(current_data)
@@ -1958,7 +2010,12 @@ class AxiomTensor:
                     current_data, current_axis_names, token, idx
                 )
                 self._assert_unique_names(current_axis_names, f"after executing ops on '{token.name}'")
-                surviving_tokens.append(current_token)
+
+                # If an op (like unfold) spawned multiple axes, extend the list!
+                if isinstance(current_token, tuple):
+                    surviving_tokens.extend(current_token)
+                else:
+                    surviving_tokens.append(current_token)
 
             elif isinstance(token, ConsumedSlot):
                 idx = current_axis_names.index(token.name)
