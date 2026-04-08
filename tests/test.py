@@ -1129,5 +1129,99 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_axes(self, y, ["d"], [4])
         assert_allclose(y.data, expected, atol=1e-5, rtol=1e-5)
 
+    # -------------------------------------------------------------------------
+    # Phase 4: Spatial Pooling
+    # -------------------------------------------------------------------------
+
+    def test_pool_1d_max_valid(self):
+        # Input: [0, 1, 2, 3, 4, 5]
+        x = tensor(jnp.arange(6, dtype=jnp.float32), ax.s)
+
+        # Window 2, stride 2, valid padding
+        y = x[ax.s.max_pool(window=2, strides=2, pad="valid")]
+
+        # Expected maxes of [0, 1], [2, 3], [4, 5]
+        expected = jnp.array([1.0, 3.0, 5.0], dtype=jnp.float32)
+
+        assert_axes(self, y, ["s"], [3])
+        assert_allclose(y.data, expected)
+
+    def test_pool_2d_avg_valid(self):
+        # 4x4 matrix
+        x = tensor(jnp.arange(16, dtype=jnp.float32).reshape(1, 4, 4, 1), ax.b, ax.h, ax.w, ax.c)
+
+        y = x[..., ax.h.avg_pool(2, strides=2), ax.w.avg_pool(2, strides=2), ax.c]
+
+        # 4x4 -> 2x2 average pool
+        expected = jnp.array([
+            [[[2.5], [4.5]],
+             [[10.5], [12.5]]]
+        ], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "h", "w", "c"], [1, 2, 2, 1])
+        assert_allclose(y.data, expected)
+
+    def test_packed_axis_pool_sugar(self):
+        # 4x4 matrix
+        x = tensor(jnp.arange(16, dtype=jnp.float32).reshape(1, 4, 4, 1), ax.b, ax.h, ax.w, ax.c)
+
+        # Notice the * operator! This unpacks the PackedAxis into two separate
+        # tokens, keeping the strict 1:1 physical axis constraint perfectly intact!
+        y = x[ax.b, *(ax.h & ax.w).max_pool(2, strides=2), ax.c]
+
+        expected = jnp.array([
+            [[[5.0], [7.0]],
+             [[13.0], [15.0]]]
+        ], dtype=jnp.float32)
+
+        assert_axes(self, y, ["b", "h", "w", "c"], [1, 2, 2, 1])
+        assert_allclose(y.data, expected)
+
+    def test_inline_assertion_passes_silently(self):
+        x = tensor(jnp.zeros((2, 256), dtype=jnp.float32), ax.b, ax.d)
+
+        # Validates physical size 256, does nothing, routes normally
+        y = x[ax.b, ax.d == 256]
+
+        assert_axes(self, y, ["b", "d"], [2, 256])
+        assert_allclose(y.data, x.data)
+
+    def test_inline_assertion_fails_loudly(self):
+        x = tensor(jnp.zeros((2, 128), dtype=jnp.float32), ax.b, ax.d)
+
+        # Physical size is 128, assertion wants 256
+        with self.assertRaises(AxiomShapeError) as context:
+            _ = x[ax.b, ax.d == 256]
+
+        self.assertIn("Assertion failed", str(context.exception))
+        self.assertIn("128", str(context.exception))
+
+    def test_relative_axis_assertion(self):
+        # A square matrix (seq_len == dim)
+        x = tensor(jnp.zeros((2, 64, 64), dtype=jnp.float32), ax.b, ax.seq, ax.d)
+
+        # Assert that seq is exactly equal to d
+        y = x[ax.b, ax.seq == ax.d, ax.d]
+        assert_axes(self, y, ["b", "seq", "d"], [2, 64, 64])
+
+        # A rectangular matrix (seq_len != dim)
+        x_bad = tensor(jnp.zeros((2, 128, 64), dtype=jnp.float32), ax.b, ax.seq, ax.d)
+
+        with self.assertRaises(AxiomShapeError):
+            _ = x_bad[ax.b, ax.seq == ax.d, ax.d]
+
+    def test_packed_axis_assertion(self):
+        # We start with a flattened spatial dimension of size 256
+        x = tensor(jnp.zeros((2, 256, 3), dtype=jnp.float32), ax.b, ax.flat, ax.c)
+
+        # Assert the flat size is exactly 256, instantly unpack it to h & w, then route
+        y = x[ax.b, (ax.flat >> (ax.h(16) & ax.w(16))) == 256, ax.c, "->", ax.b, ax.h, ax.w, ax.c]
+
+        assert_axes(self, y, ["b", "h", "w", "c"], [2, 16, 16, 3])
+
+    def test_bool_trap_prevents_chained_inequalities(self):
+        with self.assertRaises(AxiomSyntaxError):
+            _ = 0 < ax.d < 512
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

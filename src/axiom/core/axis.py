@@ -1,4 +1,4 @@
-from axiom.exceptions import AxiomShapeError
+from axiom.exceptions import AxiomShapeError, AxiomSyntaxError
 
 
 class SymbolicSize:
@@ -259,6 +259,18 @@ class AssocScanOp:
         return "AssocScanOp()"
 
 
+class PoolOp:
+    def __init__(self, kind: str, window: int, strides: int = None, pad: str = "valid"):
+        if kind not in ("max", "avg"):
+            raise ValueError("Pool kind must be 'max' or 'avg'.")
+        self.kind = kind
+        self.window = window
+        self.strides = strides if strides is not None else window
+        self.pad = pad.lower()
+
+    def __repr__(self):
+        return f"PoolOp('{self.kind}', window={self.window}, strides={self.strides})"
+
 class WhereOp:
     def __init__(self, condition, false_tensor):
         self.condition = condition
@@ -269,6 +281,7 @@ class PadOp:
         self.pad_width = tuple(pad_width)
         self.mode = mode
         self.value = value
+
 
 class GatherOp:
     def __init__(self, indices):
@@ -305,6 +318,15 @@ class StopGradientOp:
     def __repr__(self):
         return "StopGradientOp()"
 
+class AssertOp:
+    def __init__(self, op_str: str, target):
+        self.op_str = op_str
+        self.target = target
+
+    def __repr__(self):
+        target_repr = self.target.name if hasattr(self.target, "name") else self.target
+        return f"AssertOp('{self.op_str}', {target_repr})"
+
 class ScatterOp:
     def __init__(self, indices, updates, mode="update"):
         if mode not in ("update", "add"):
@@ -315,7 +337,7 @@ class ScatterOp:
 
 
 def _is_pack_safe_axis_op(op) -> bool:
-    return isinstance(op, (ConvModeOp, ConvStrideOp, ConvDilationOp))
+    return isinstance(op, (ConvModeOp, ConvStrideOp, ConvDilationOp, PoolOp))
 
 
 def _validate_pack_child(axis):
@@ -466,6 +488,12 @@ class PackedAxis:
             ]
         )
 
+    def max_pool(self, window: int, strides: int = None, pad: str = "valid"):
+        return PackedAxis(*[a.max_pool(window, strides, pad) for a in self.axes], ops=list(self.ops))
+
+    def avg_pool(self, window: int, strides: int = None, pad: str = "valid"):
+        return PackedAxis(*[a.avg_pool(window, strides, pad) for a in self.axes], ops=list(self.ops))
+
     def where(self, condition, false_tensor):
         return self._spawn(list(self.ops) + [WhereOp(condition, false_tensor)])  # Use self.__class__(...) for Axis
 
@@ -580,6 +608,36 @@ class PackedAxis:
 
     def dilate(self, n: int):
         return self._map_conv_meta("dilate", n)
+
+    # -------------------------------------------------------------------------
+    # Inline Shape Assertions
+    # -------------------------------------------------------------------------
+
+    def __eq__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("==", other)])
+
+    def __le__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("<=", other)])
+
+    def __ge__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp(">=", other)])
+
+    def __lt__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("<", other)])
+
+    def __gt__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp(">", other)])
+
+    def __bool__(self):
+        raise AxiomSyntaxError(
+            f"Truth value of an Axis is ambiguous. "
+            f"Do not chain inequalities (e.g., use `ax.d.assert_gt(0).assert_lt(5)` "
+            f"instead of `0 < ax.d < 5`)."
+        )
+
+    def __iter__(self):
+        """Allows Python's * operator to unpack the axes seamlessly."""
+        return iter(self.axes)
 
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
@@ -866,6 +924,12 @@ class Axis:
             self.source_name
         )
 
+    def max_pool(self, window: int, strides: int = None, pad: str = "valid"):
+        return self._spawn(list(self.ops) + [PoolOp("max", window, strides, pad)])
+
+    def avg_pool(self, window: int, strides: int = None, pad: str = "valid"):
+        return self._spawn(list(self.ops) + [PoolOp("avg", window, strides, pad)])
+
     def dropout(self, rate=0.1):
         return Axis(self.name, self.size, list(self.ops) + [DropoutOp(rate)], self.source_name)
 
@@ -992,6 +1056,32 @@ class Axis:
 
     def dilate(self, n: int):
         return self._spawn(list(self.ops) + [ConvDilationOp(n)])
+
+    # -------------------------------------------------------------------------
+    # Inline Shape Assertions
+    # -------------------------------------------------------------------------
+
+    def __eq__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("==", other)])
+
+    def __le__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("<=", other)])
+
+    def __ge__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp(">=", other)])
+
+    def __lt__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp("<", other)])
+
+    def __gt__(self, other):
+        return self._spawn(list(self.ops) + [AssertOp(">", other)])
+
+    def __bool__(self):
+        raise AxiomSyntaxError(
+            f"Truth value of an Axis is ambiguous. "
+            f"Do not chain inequalities (e.g., use `ax.d.assert_gt(0).assert_lt(5)` "
+            f"instead of `0 < ax.d < 5`)."
+        )
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"

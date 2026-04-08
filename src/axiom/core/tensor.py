@@ -12,7 +12,7 @@ from .axis import (
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
     ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
-    ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp,
+    ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp, PoolOp, AssertOp,
 )
 from .module import context
 from .. import init as a_init
@@ -200,7 +200,10 @@ class AxiomTensor:
         if not isinstance(item, tuple):
             item = (item,)
 
-        if item.count(Ellipsis) > 1:
+        # Type-safe search to bypass Axis.__eq__
+        ellipsis_indices = [i for i, t in enumerate(item) if t is Ellipsis]
+
+        if len(ellipsis_indices) > 1:
             raise AxiomSyntaxError("idx[...] allows at most one ellipsis (...).")
 
         for token in item:
@@ -222,8 +225,8 @@ class AxiomTensor:
                 f"Too many indices for tensor rank {len(self.axes)}: got {specified} positional indices."
             )
 
-        if Ellipsis in item:
-            ellipsis_pos = item.index(Ellipsis)
+        if ellipsis_indices:
+            ellipsis_pos = ellipsis_indices[0]
             fill = len(self.axes) - specified
             item = item[:ellipsis_pos] + (slice(None),) * fill + item[ellipsis_pos + 1:]
         else:
@@ -352,9 +355,12 @@ class AxiomTensor:
     # -------------------------------------------------------------------------
 
     def _resolve_ellipsis(self, tokens: Tuple[Any, ...], reference_axes: Tuple[Any, ...]) -> List[Any]:
-        if Ellipsis not in tokens:
+        # Use 'is' to bypass __eq__ overload
+        ellipsis_indices = [i for i, t in enumerate(tokens) if t is Ellipsis]
+
+        if not ellipsis_indices:
             return list(tokens)
-        if tokens.count(Ellipsis) > 1:
+        if len(ellipsis_indices) > 1:
             raise AxiomSyntaxError("Only one Ellipsis (...) is allowed per side.")
 
         explicit_names = set()
@@ -1291,6 +1297,40 @@ class AxiomTensor:
             elif op == "cos":
                 current_data = jnp.cos(current_data)
 
+            elif isinstance(op, PoolOp):
+                if op.kind == "max":
+                    init_val = -jnp.inf
+                    reduce_fn = jax.lax.max
+                else:  # avg
+                    init_val = 0.0
+                    reduce_fn = jax.lax.add
+
+                # Build n-dimensional window and stride configs
+                window_dims = [1] * current_data.ndim
+                window_dims[idx] = op.window
+
+                stride_dims = [1] * current_data.ndim
+                stride_dims[idx] = op.strides
+
+                current_data = jax.lax.reduce_window(
+                    current_data,
+                    init_val,
+                    reduce_fn,
+                    window_dimensions=window_dims,
+                    window_strides=stride_dims,
+                    padding=op.pad.upper()
+                )
+
+                if op.kind == "avg":
+                    current_data = current_data / op.window
+
+                # Materialize the newly downsampled size for the LHS router
+                current_token = Axis(
+                    current_token.name,
+                    int(current_data.shape[idx]),
+                    source_name=current_token.source_name
+                )
+
 
             elif isinstance(op, ClampOp):
                 # Updated to use JAX's modern 'min' and 'max' kwargs
@@ -1751,6 +1791,41 @@ class AxiomTensor:
                     param_prefix="_axiom_conv_bias",
                 )
 
+            # --- Inline Assertions ---
+            elif isinstance(op, AssertOp):
+                physical_size = int(current_data.shape[idx])
+                target_val = op.target
+
+                size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+
+                # 1. Dynamically resolve the target if it's another Axis or a SymbolicSize
+                if hasattr(target_val, "resolve"):
+                    target_val = target_val.resolve(size_map)
+                elif hasattr(target_val, "name"):
+                    if target_val.name not in size_map:
+                        raise AxiomShapeError(
+                            f"Cannot assert '{current_token.name} {op.op_str} {target_val.name}': "
+                            f"axis '{target_val.name}' is not present in the current tensor."
+                        )
+                    target_val = size_map[target_val.name]
+
+                # 2. Evaluate the strict mathematical condition
+                if op.op_str == "==" and physical_size != target_val:
+                    raise AxiomShapeError(
+                        f"Assertion failed: '{current_token.name}' size ({physical_size}) == {target_val}.")
+                elif op.op_str == "<=" and physical_size > target_val:
+                    raise AxiomShapeError(
+                        f"Assertion failed: '{current_token.name}' size ({physical_size}) <= {target_val}.")
+                elif op.op_str == ">=" and physical_size < target_val:
+                    raise AxiomShapeError(
+                        f"Assertion failed: '{current_token.name}' size ({physical_size}) >= {target_val}.")
+                elif op.op_str == "<" and physical_size >= target_val:
+                    raise AxiomShapeError(
+                        f"Assertion failed: '{current_token.name}' size ({physical_size}) < {target_val}.")
+                elif op.op_str == ">" and physical_size <= target_val:
+                    raise AxiomShapeError(
+                        f"Assertion failed: '{current_token.name}' size ({physical_size}) > {target_val}.")
+
         return current_data, current_axis_names, current_token
 
     # -------------------------------------------------------------------------
@@ -1761,12 +1836,14 @@ class AxiomTensor:
         if not isinstance(tokens, tuple):
             tokens = (tokens,)
 
-        arrow_count = tokens.count("->")
-        if arrow_count > 1:
+        # Type-safe arrow extraction to avoid triggering __eq__ on Axis objects
+        arrow_indices = [i for i, t in enumerate(tokens) if isinstance(t, str) and t == "->"]
+
+        if len(arrow_indices) > 1:
             raise AxiomSyntaxError("Multiple '->' operators found.")
 
-        if arrow_count == 1:
-            split_idx = tokens.index("->")
+        if len(arrow_indices) == 1:
+            split_idx = arrow_indices[0]
             lhs_tokens, rhs_tokens = tokens[:split_idx], tokens[split_idx + 1:]
         else:
             lhs_tokens, rhs_tokens = tokens, None
