@@ -401,6 +401,28 @@ class AxiomTensor:
             return other.__truediv__(self)
         return AxiomTensor(other / self.data, self.axes)
 
+    # Add to AxiomTensor class in tensor.py
+    def apply_sharding(self) -> "AxiomTensor":
+        """
+        Dynamically generates a JAX PartitionSpec based on the current
+        physical layout of the axes, and applies the sharding constraint.
+        """
+        import jax
+
+        # 1. Interrogate the current physical layout
+        mesh_targets = []
+        for a in self.axes:
+            # If the axis has a mesh tag, use it. Otherwise, None (replicate).
+            mesh_targets.append(getattr(a, "mesh", None))
+
+        # 2. Build the precise JAX spec for this exact permutation
+        spec = jax.sharding.PartitionSpec(*mesh_targets)
+
+        # 3. Apply the constraint to the underlying JAX array
+        sharded_data = jax.lax.with_sharding_constraint(self.data, spec)
+
+        return AxiomTensor(sharded_data, self.axes)
+
     # -------------------------------------------------------------------------
     # Ellipsis
     # -------------------------------------------------------------------------
@@ -2146,3 +2168,87 @@ class AxiomDropout(nnx.Module):
         keep_prob = 1.0 - self.rate
         mask = jax.random.bernoulli(key, keep_prob, x.shape)
         return jnp.where(mask, x / keep_prob, jnp.zeros_like(x))
+
+
+def vmap(fn, over: Axis):
+    """
+    Semantic vectorization. Maps a function over a specific logical axis,
+    regardless of where it exists physically in the inputs.
+    """
+    import jax
+
+    def wrapped_fn(*args, **kwargs):
+        in_axes_data = []
+        raw_args = []
+
+        for arg in args:
+            if isinstance(arg, AxiomTensor):
+                names = [a.name for a in arg.axes]
+                idx = names.index(over.name) if over.name in names else None
+                in_axes_data.append(idx)
+                raw_args.append(arg.data)
+            else:
+                in_axes_data.append(None)
+                raw_args.append(arg)
+
+        # -------------------------------------------------------------------
+        # 1. Shape Inference (Dry Run) to extract the topology safely
+        # -------------------------------------------------------------------
+        def shape_inference_wrapper(*eval_args):
+            inner_tensors = []
+            for original_arg, eval_data, in_idx in zip(args, eval_args, in_axes_data):
+                if isinstance(original_arg, AxiomTensor):
+                    # Strip out the mapped axis from the inner scope
+                    inner_axes = tuple(a for i, a in enumerate(original_arg.axes) if
+                                       i != in_idx) if in_idx is not None else original_arg.axes
+                    inner_tensors.append(AxiomTensor(eval_data, inner_axes))
+                else:
+                    inner_tensors.append(eval_data)
+            return fn(*inner_tensors, **kwargs)
+
+        eval_shapes = []
+        for arg, in_idx in zip(args, in_axes_data):
+            if isinstance(arg, AxiomTensor):
+                # Build zero-cost ShapeDtypeStructs so JAX doesn't execute FLOPs
+                inner_shape = tuple(
+                    s for i, s in enumerate(arg.shape) if i != in_idx) if in_idx is not None else arg.shape
+                eval_shapes.append(jax.ShapeDtypeStruct(inner_shape, arg.dtype))
+            else:
+                eval_shapes.append(arg)
+
+        # eval_shape safely returns the PyTree output containing our Axis metadata!
+        dummy_out = jax.eval_shape(shape_inference_wrapper, *eval_shapes)
+        inner_out_axes = dummy_out.axes
+
+        # -------------------------------------------------------------------
+        # 2. Pure JAX Execution
+        # -------------------------------------------------------------------
+        def raw_compute(*inner_raw_args):
+            inner_tensors = []
+            for original_arg, raw_data, in_idx in zip(args, inner_raw_args, in_axes_data):
+                if isinstance(original_arg, AxiomTensor):
+                    inner_axes = tuple(a for i, a in enumerate(original_arg.axes) if
+                                       i != in_idx) if in_idx is not None else original_arg.axes
+                    inner_tensors.append(AxiomTensor(raw_data, inner_axes))
+                else:
+                    inner_tensors.append(raw_data)
+
+            out_tensor = fn(*inner_tensors, **kwargs)
+            # CRITICAL: We ONLY return the raw array so JAX vmap doesn't choke on Python objects
+            return out_tensor.data
+
+        # Execute JAX vmap over the pure array data
+        jitted_vmap = jax.vmap(raw_compute, in_axes=tuple(in_axes_data))
+        vmapped_data = jitted_vmap(*raw_args)
+
+        # -------------------------------------------------------------------
+        # 3. Reconstruct the final output AxiomTensor
+        # -------------------------------------------------------------------
+        # JAX standard vmap places the vectorized dimension at index 0.
+        # We prepend our semantic `over` axis to the front of the layout.
+        mapped_axis_def = Axis(over.name, int(vmapped_data.shape[0]), source_name=over.name)
+        final_axes = (mapped_axis_def,) + inner_out_axes
+
+        return AxiomTensor(vmapped_data, final_axes)
+
+    return wrapped_fn

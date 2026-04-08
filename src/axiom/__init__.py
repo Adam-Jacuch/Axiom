@@ -1,5 +1,5 @@
 from .core.axis import Axis
-from .core.tensor import AxiomTensor
+from .core.tensor import AxiomTensor, vmap
 from .core.module import Module, context
 from . import init
 

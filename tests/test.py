@@ -1379,5 +1379,54 @@ class AxiomRuntimeTests(unittest.TestCase):
 
         self.assertIn("Tensor is too small", str(context.exception))
 
+    # -------------------------------------------------------------------------
+    # Distributed & Vectorization Tests (Phase 4)
+    # -------------------------------------------------------------------------
+
+    def test_semantic_vmap_stateless(self):
+        from axiom import tensor, vmap
+
+        # 1. A pure function that only knows about Sequence and Channel
+        def process_token(x):
+            # Layout coming in is [seq, c].
+            # We pool the sequence on the LHS, then route to [c, seq] on the RHS!
+            return x[ax.seq.max_pool(window=2), ax.c, "->", ax.c, ax.seq]
+
+        # 2. Input data has Batch! Layout: [Batch=4, Seq=10, Channel=8]
+        data = jnp.arange(320, dtype=jnp.float32).reshape(4, 10, 8)
+        x_batched = tensor(data, ax.b, ax.seq, ax.c)
+
+        # 3. Vectorize over batch
+        batched_process = vmap(process_token, over=ax.b)
+
+        # 4. Execute
+        y = batched_process(x_batched)
+
+        # 5. Output should be [b, c, seq] where seq is now 5
+        assert_axes(self, y, ["b", "c", "seq"], [4, 8, 5])
+
+    def test_semantic_sharding(self):
+        from axiom import tensor
+        import jax
+        import numpy as np
+
+        # Create a mock 1-device supercomputer mesh for the test!
+        devices = np.array(jax.devices()).reshape(1, 1)
+        mesh = jax.sharding.Mesh(devices, ("data_mesh", "model_mesh"))
+
+        with mesh:
+            # 1. Tag axes with hardware meshes
+            ax_b_sharded = ax.b.shard("data_mesh")
+            ax_d_sharded = ax.d.shard("model_mesh")
+
+            # 2. Create the tensor. Layout is [b, seq, d]
+            x = tensor(jnp.zeros((4, 10, 8)), ax_b_sharded, ax.seq, ax_d_sharded)
+
+            # 3. Permute using the routing arrow and apply the sharding constraint!
+            y = x[..., "->", ax.seq, ax_d_sharded, ax_b_sharded].apply_sharding()
+
+            # We ensure the tensor survived the JAX constraint barrier
+            assert_axes(self, y, ["seq", "d", "b"], [10, 8, 4])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

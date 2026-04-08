@@ -1074,6 +1074,14 @@ class Axis:
     def dilate(self, n: int):
         return self._spawn(list(self.ops) + [ConvDilationOp(n)])
 
+    # Sharding
+    def shard(self, mesh_name: str):
+        """Tags this axis to be sharded across a specific hardware mesh."""
+        new_axis = self._spawn()
+        # Attach the mesh destination directly to the object
+        new_axis.mesh = mesh_name
+        return new_axis
+
     # -------------------------------------------------------------------------
     # Inline Shape Assertions
     # -------------------------------------------------------------------------
