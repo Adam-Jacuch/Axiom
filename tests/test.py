@@ -1223,5 +1223,61 @@ class AxiomRuntimeTests(unittest.TestCase):
         with self.assertRaises(AxiomSyntaxError):
             _ = 0 < ax.d < 512
 
+    # -------------------------------------------------------------------------
+    # Constructors & Initialization
+    # -------------------------------------------------------------------------
+
+    def test_constructors(self):
+        from axiom import AxiomTensor
+
+        # 1. Zeros
+        z = AxiomTensor.zeros(ax.b(2), ax.d(4))
+        assert_axes(self, z, ["b", "d"], [2, 4])
+        assert_allclose(z.data, jnp.zeros((2, 4)))
+
+        # 2. Ones
+        o = AxiomTensor.ones(ax.seq(3), ax.d(5), dtype=jnp.float16)
+        assert_axes(self, o, ["seq", "d"], [3, 5])
+        assert_allclose(o.data, jnp.ones((3, 5)))
+        self.assertEqual(o.dtype, jnp.float16)
+
+        # 3. Full
+        f = AxiomTensor.full(-3.14, ax.h(2), ax.w(2))
+        assert_axes(self, f, ["h", "w"], [2, 2])
+        assert_allclose(f.data, jnp.full((2, 2), -3.14))
+
+    def test_constructor_guardrails(self):
+        from axiom import AxiomTensor
+
+        # Fails: Missing size
+        with self.assertRaises(AxiomShapeError):
+            _ = AxiomTensor.zeros(ax.b, ax.d(256))
+
+        # Fails: Symbolic size (can't allocate memory on a promise)
+        with self.assertRaises(AxiomShapeError):
+            _ = AxiomTensor.ones(ax.b(32), ax.d * 2)
+
+        # Fails: Packed Axis
+        with self.assertRaises(TypeError):
+            _ = AxiomTensor.zeros(ax.b(32), ax.h(16) & ax.w(16))
+
+    def test_like_constructors(self):
+        from axiom import AxiomTensor
+
+        base = AxiomTensor.full(5.0, ax.b(2), ax.d(3))
+
+        z = base.zeros_like()
+        assert_axes(self, z, ["b", "d"], [2, 3])
+        assert_allclose(z.data, jnp.zeros((2, 3)))
+
+        o = base.ones_like(dtype=jnp.int32)
+        assert_axes(self, o, ["b", "d"], [2, 3])
+        assert_allclose(o.data, jnp.ones((2, 3)))
+        self.assertEqual(o.dtype, jnp.int32)
+
+        f = base.full_like(9.9)
+        assert_axes(self, f, ["b", "d"], [2, 3])
+        assert_allclose(f.data, jnp.full((2, 3), 9.9))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

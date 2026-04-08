@@ -44,6 +44,45 @@ class AxiomTensor:
         axes = tuple(Axis(name, size, source_name=source_name) for name, size, source_name in axes_spec)
         return cls(data, axes)
 
+    @classmethod
+    def _factory(cls, fill_value, axes: Tuple[Any, ...], dtype) -> "AxiomTensor":
+        shape = []
+        for a in axes:
+            if not isinstance(a, Axis):
+                raise TypeError(f"Axiom constructors require plain Axis objects. Got {type(a).__name__}.")
+            if a.size is None:
+                raise AxiomShapeError(
+                    f"Cannot allocate memory for axis '{a.name}' without a concrete size. "
+                    f"Use e.g., ax.{a.name}(128)."
+                )
+            if hasattr(a.size, "resolve"):
+                raise AxiomShapeError(
+                    f"Cannot allocate memory using a symbolic size on axis '{a.name}'. "
+                    f"Constructors require concrete integers."
+                )
+            shape.append(int(a.size))
+
+        if fill_value == 0.0:
+            data = jnp.zeros(shape, dtype=dtype)
+        elif fill_value == 1.0:
+            data = jnp.ones(shape, dtype=dtype)
+        else:
+            data = jnp.full(shape, fill_value, dtype=dtype)
+
+        return cls(data, axes)
+
+    @classmethod
+    def zeros(cls, *axes: Axis, dtype=jnp.float32) -> "AxiomTensor":
+        return cls._factory(0.0, axes, dtype)
+
+    @classmethod
+    def ones(cls, *axes: Axis, dtype=jnp.float32) -> "AxiomTensor":
+        return cls._factory(1.0, axes, dtype)
+
+    @classmethod
+    def full(cls, fill_value, *axes: Axis, dtype=jnp.float32) -> "AxiomTensor":
+        return cls._factory(fill_value, axes, dtype)
+
     @property
     def shape(self):
         return self.data.shape
@@ -55,6 +94,18 @@ class AxiomTensor:
     @property
     def ndim(self):
         return self.data.ndim
+
+    def zeros_like(self, dtype=None) -> "AxiomTensor":
+        use_dtype = dtype if dtype is not None else self.dtype
+        return AxiomTensor(jnp.zeros_like(self.data, dtype=use_dtype), self.axes)
+
+    def ones_like(self, dtype=None) -> "AxiomTensor":
+        use_dtype = dtype if dtype is not None else self.dtype
+        return AxiomTensor(jnp.ones_like(self.data, dtype=use_dtype), self.axes)
+
+    def full_like(self, fill_value, dtype=None) -> "AxiomTensor":
+        use_dtype = dtype if dtype is not None else self.dtype
+        return AxiomTensor(jnp.full_like(self.data, fill_value, dtype=use_dtype), self.axes)
 
     def rename(self, old_axis, new_axis):
         new_axes = tuple(new_axis if a.name == old_axis.name else a for a in self.axes)
