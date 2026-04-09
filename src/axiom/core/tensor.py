@@ -495,6 +495,31 @@ class AxiomTensor:
 
         return tuple(results)
 
+    def unbind(self, axis: Axis) -> Tuple["AxiomTensor", ...]:
+        """
+        Physically slices the tensor along the specified logical axis and
+        completely consumes/drops that axis from the resulting tensors.
+        """
+        idx = self._axis_index(axis.name)
+        dim_size = int(self.data.shape[idx])
+
+        # 1. To cleanly unpack the physical JAX array, move the target axis to the front.
+        moved_data = jnp.moveaxis(self.data, idx, 0)
+
+        # The shape of a single slice, skipping the first (now unbinded) dimension
+        slice_shape = moved_data.shape[1:]
+
+        # 2. Generate the new logical layout, dropping the target axis
+        # and materializing the concrete physical sizes.
+        surviving_axes = [a for i, a in enumerate(self.axes) if i != idx]
+        new_axes = tuple(
+            Axis(a.name, int(slice_shape[i]), source_name=getattr(a, "source_name", a.name))
+            for i, a in enumerate(surviving_axes)
+        )
+
+        # 3. Package each physical slice back into a fresh AxiomTensor
+        return tuple(AxiomTensor(moved_data[i], new_axes) for i in range(dim_size))
+    
     @classmethod
     def concat(cls, tensors: List["AxiomTensor"], axis: Axis) -> "AxiomTensor":
         """Concatenates multiple AxiomTensors along the specified axis."""

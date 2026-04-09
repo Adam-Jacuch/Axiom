@@ -801,6 +801,30 @@ class AxiomRuntimeTests(unittest.TestCase):
         assert_allclose(chunks[0].data, expected_chunk_0)
         assert_allclose(chunks[1].data, expected_chunk_1)
 
+    def test_structural_unbind(self):
+        # Simulate a fused QKV projection: [batch=2, qkv=3, seq=4, dim=5]
+        data = jnp.arange(120, dtype=jnp.float32).reshape(2, 3, 4, 5)
+        x = tensor(data, ax.b, ax.qkv(3), ax.s, ax.d)
+
+        # Unbind along the qkv axis!
+        q, k, v = x.unbind(ax.qkv)
+
+        # 1. The qkv axis should be completely stripped from the logical layout
+        assert_axes(self, q, ["b", "s", "d"], [2, 4, 5])
+        assert_axes(self, k, ["b", "s", "d"], [2, 4, 5])
+        assert_axes(self, v, ["b", "s", "d"], [2, 4, 5])
+
+        # 2. The data should perfectly match the physical slices
+        assert_allclose(q.data, data[:, 0, :, :])
+        assert_allclose(k.data, data[:, 1, :, :])
+        assert_allclose(v.data, data[:, 2, :, :])
+
+    def test_unbind_axis_not_found_raises(self):
+        x = tensor(jnp.zeros((2, 4), dtype=jnp.float32), ax.b, ax.d)
+
+        with self.assertRaises(AxiomShapeError):
+            _ = x.unbind(ax.qkv)
+
     def test_structural_concat(self):
         from axiom import AxiomTensor
 
