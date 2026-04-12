@@ -377,6 +377,65 @@ def _validate_pack_operand(obj):
         raise TypeError("Can only pack Axis or PackedAxis.")
 
 
+class AxisView:
+    def __init__(self, name: str, slice_obj: slice, inner_ops=None, outer_ops=None, is_closed=False):
+        self.name = name
+        self.source_name = name
+        self.slice_obj = slice_obj
+        self.inner_ops = list(inner_ops) if inner_ops else []
+        self.outer_ops = list(outer_ops) if outer_ops else []
+        self.is_closed = is_closed
+
+    @property
+    def ops(self):
+        # Compatibility property for functions checking if a token carries ops
+        return self.inner_ops + self.outer_ops
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            if item == slice(None) and not self.is_closed:
+                # The Context Closer: [:]
+                return AxisView(self.name, self.slice_obj, self.inner_ops, self.outer_ops, is_closed=True)
+            raise AxiomSyntaxError("AxisView only supports [:] to close the scope.")
+        raise AxiomSyntaxError("Invalid AxisView indexing.")
+
+    def __getattr__(self, attr):
+        # Monadic Delegation: We map the method call to a temporary Axis object
+        dummy = Axis(self.name)
+        if not hasattr(dummy, attr):
+            raise AttributeError(f"AxisView has no attribute '{attr}'")
+
+        method = getattr(dummy, attr)
+
+        def wrapper(*args, **kwargs):
+            result_axis = method(*args, **kwargs)
+
+            # --- FIXED: Handle Reduction Operations ---
+            if isinstance(result_axis, ConsumedSlot):
+                if not self.is_closed:
+                    raise AxiomShapeError("Cannot apply reduction operations (like sum) inside an open slice scope.")
+                new_op = result_axis
+            else:
+                new_op = result_axis.ops[-1]
+
+            new_inner = list(self.inner_ops)
+            new_outer = list(self.outer_ops)
+
+            # Route it based on the Monad's current state
+            if not self.is_closed:
+                new_inner.append(new_op)
+            else:
+                new_outer.append(new_op)
+
+            return AxisView(self.name, self.slice_obj, new_inner, new_outer, self.is_closed)
+
+        return wrapper
+
+    def __repr__(self):
+        state = "CLOSED" if self.is_closed else "OPEN"
+        return f"AxisView('{self.name}', slice={self.slice_obj}, inner={len(self.inner_ops)}, outer={len(self.outer_ops)}, {state})"
+
+
 class PackedAxis:
     def __init__(self, *axes, ops=None):
         for a in axes:
@@ -652,6 +711,12 @@ class PackedAxis:
     def __iter__(self):
         """Allows Python's * operator to unpack the axes seamlessly."""
         return iter(self.axes)
+
+    def __getitem__(self, item):
+        raise AxiomSyntaxError(
+            "Cannot semantically slice a PackedAxis. Slice the base axes before packing, "
+            "or route to a flat axis first."
+        )
 
     def __repr__(self):
         return f"PackedAxis({', '.join([a.name for a in self.axes])})"
@@ -1107,6 +1172,11 @@ class Axis:
             f"Do not chain inequalities (e.g., use `ax.d.assert_gt(0).assert_lt(5)` "
             f"instead of `0 < ax.d < 5`)."
         )
+
+    def __getitem__(self, item) -> AxisView:
+        if not isinstance(item, slice):
+            raise AxiomSyntaxError("Axis indexing only supports slices (e.g., ax.sq[:-1]).")
+        return AxisView(self.name, item)
 
     def __repr__(self):
         return f"Axis('{self.name}', size={self.size}, ops={self.ops})"

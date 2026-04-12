@@ -1452,5 +1452,166 @@ class AxiomRuntimeTests(unittest.TestCase):
             # We ensure the tensor survived the JAX constraint barrier
             assert_axes(self, y, ["seq", "d", "b"], [10, 8, 4])
 
+    def test_semantic_slicing_autoregressive(self):
+        # Shape (2, 5)
+        data = jnp.array([
+            [10, 20, 30, 40, 50],
+            [11, 21, 31, 41, 51]
+        ], dtype=jnp.float32)
+
+        x = tensor(data, ax.b, ax.sq)
+
+        # Shift operations
+        inputs = x[..., ax.sq[:-1]]
+        targets = x[..., ax.sq[1:]]
+
+        # Verify axes updated correctly
+        assert_axes(self, inputs, ["b", "sq"], [2, 4])
+        assert_axes(self, targets, ["b", "sq"], [2, 4])
+
+        # Verify data sliced correctly on the physical level
+        expected_inputs = jnp.array([[10, 20, 30, 40], [11, 21, 31, 41]], dtype=jnp.float32)
+        expected_targets = jnp.array([[20, 30, 40, 50], [21, 31, 41, 51]], dtype=jnp.float32)
+
+        assert_allclose(inputs.data, expected_inputs)
+        assert_allclose(targets.data, expected_targets)
+
+    def test_semantic_slicing_rejects_multiple_ellipses(self):
+        x = tensor(jnp.zeros((2, 4, 8)), ax.b, ax.sq, ax.d)
+
+        with self.assertRaises(AxiomSyntaxError):
+            # Should block standard multiple ellipses
+            _ = x[..., ax.sq[1:3], ...]
+
+    def test_apply_sharding_guardrail_raises_without_mesh(self):
+        # A tensor explicitly tagged for sharding on "data"
+        x = tensor(jnp.zeros((4, 8)), ax.b(4).shard("data"), ax.d(8))
+
+        with self.assertRaisesRegex(RuntimeError, "no JAX Mesh is active"):
+            # Should intercept the JAX crash and raise our custom Axiom error
+            _ = x.apply_sharding()
+
+    def test_apply_sharding_succeeds_with_mesh(self):
+        from jax.sharding import Mesh
+        from jax.experimental import mesh_utils
+
+        # Create a mock 1D mesh using local CPU/GPU devices
+        devices = mesh_utils.create_device_mesh((jax.device_count(),))
+        mesh = Mesh(devices, axis_names=('data',))
+
+        x = tensor(jnp.zeros((4, 8)), ax.b(4).shard("data"), ax.d(8))
+
+        # Inside the context, sharding should apply flawlessly
+        with mesh:
+            y = x.apply_sharding()
+            self.assertEqual(y.data.shape, (4, 8))
+
+    def test_init_linspace_concretization_tracers(self):
+        from axiom import init as a_init
+
+        # Mocking an XLA Abstract Tracer that provides a `.val`
+        class MockTracer:
+            def __init__(self, val):
+                self.val = val
+
+        # Simulating JAX passing a tracer shape during jax.eval_shape or remat
+        tracer_shape = (MockTracer(5),)
+
+        # Initialize
+        init_fn = a_init.linspace(0.0, 1.0)
+        rng = jax.random.PRNGKey(0)
+
+        # Should NOT raise a ConcretizationTypeError
+        arr = init_fn(rng, tracer_shape)
+
+        self.assertEqual(arr.shape, (5,))
+        expected = jnp.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=jnp.float32)
+        assert_allclose(arr, expected)
+
+    def test_monadic_targeted_mutation(self):
+        # Shape: (1, 4)
+        data = jnp.array([[10.0, 20.0, 30.0, 40.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # Monad action:
+        # 1. Open scope on the second half: ax.d[2:]
+        # 2. Mutate inner: .square()
+        # 3. Close scope: [:]
+        y = x[..., ax.d[2:].square()[:]]
+
+        # Expected: First half untouched, second half squared
+        assert_axes(self, y, ["b", "d"], [1, 4])
+        expected = jnp.array([[10.0, 20.0, 900.0, 1600.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
+    def test_monadic_scope_escape_and_reduce(self):
+        # Shape: (1, 4)
+        data = jnp.array([[1.0, 2.0, 3.0, 4.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # Monad action:
+        # 1. Open scope on first half: ax.d[:2]
+        # 2. Mutate inner: .square()
+        # 3. Close scope: [:]
+        # 4. Mutate outer (global): .sum()
+        y = x[..., ax.d[:2].square()[:].sum()]
+
+        # Expected workflow:
+        # inner square: [1.0, 4.0, 3.0, 4.0]
+        # outer sum over d: 1 + 4 + 3 + 4 = 12
+        assert_axes(self, y, ["b"], [1])
+        expected = jnp.array([12.0], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
+    def test_monadic_scope_escape_and_pad(self):
+        # Shape: (1, 3)
+        data = jnp.array([[10.0, 20.0, 30.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # Monad action:
+        # 1. Open scope on middle element: ax.d[1:2]
+        # 2. Mutate inner: .exp()
+        # 3. Close scope: [:]
+        # 4. Mutate outer (global): .pad()
+        y = x[..., ax.d[1:2].exp()[:].pad((1, 1))]
+
+        # Expected workflow:
+        # inner exp: [10.0, 400.0 (approx of exp), 30.0]
+        # outer pad: [0.0, 10.0, exp(20), 30.0, 0.0]
+        assert_axes(self, y, ["b", "d"], [1, 5])
+
+        expected_exp = jnp.exp(20.0)
+        expected = jnp.array([[0.0, 10.0, expected_exp, 30.0, 0.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
+    def test_monadic_dynamic_boundary_and_step(self):
+        # Shape: (1, 6)
+        data = jnp.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # 1. Use a dynamic boundary (ax.d // 2) -> slice ends at index 3
+        # 2. Use a step size (::2) -> targets indices 0 and 2
+        # 3. Square them and patch them back in
+        y = x[..., ax.d[:ax.d // 2:2].square()[:]]
+
+        assert_axes(self, y, ["b", "d"], [1, 6])
+        # Indices 0 and 2 (values 1.0 and 3.0) are squared
+        expected = jnp.array([[1.0, 2.0, 9.0, 4.0, 5.0, 6.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
+    def test_monadic_extract_mutated_slice(self):
+        # Shape: (1, 4)
+        data = jnp.array([[10.0, 20.0, 30.0, 40.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # We DO NOT use [:] here. We expect the compiler to return the
+        # mutated slice, NOT the patched parent.
+        y = x[..., ax.d[2:].square()]
+
+        # The output should just be the squared second half!
+        assert_axes(self, y, ["b", "d"], [1, 2])
+        expected = jnp.array([[900.0, 1600.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

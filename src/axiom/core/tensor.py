@@ -13,6 +13,7 @@ from .axis import (
     RollOp, FillOp, AttendOp,
     ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
     ConvModeOp, ConvStrideOp, ConvDilationOp, PowOp, PoolOp, AssertOp, UnfoldOp,
+    AxisView,
 )
 from .module import context
 from .. import init as a_init
@@ -409,17 +410,23 @@ class AxiomTensor:
         """
         import jax
 
-        # 1. Interrogate the current physical layout
         mesh_targets = []
         for a in self.axes:
-            # If the axis has a mesh tag, use it. Otherwise, None (replicate).
             mesh_targets.append(getattr(a, "mesh", None))
 
-        # 2. Build the precise JAX spec for this exact permutation
         spec = jax.sharding.PartitionSpec(*mesh_targets)
 
-        # 3. Apply the constraint to the underlying JAX array
-        sharded_data = jax.lax.with_sharding_constraint(self.data, spec)
+        # Robust Automatic Mesh Guardrail
+        try:
+            sharded_data = jax.lax.with_sharding_constraint(self.data, spec)
+        except RuntimeError as e:
+            # Intercept the JAX error to provide our actionable Axiom error
+            if "requires a non-empty mesh" in str(e):
+                raise RuntimeError(
+                    "Axiom: apply_sharding() called but no JAX Mesh is active. "
+                    "On multi-device environments (TPU/Multi-GPU), you must wrap your training loop in 'with mesh:'."
+                ) from e
+            raise e  # If it's a different runtime error, let it surface normally
 
         return AxiomTensor(sharded_data, self.axes)
 
@@ -519,7 +526,7 @@ class AxiomTensor:
 
         # 3. Package each physical slice back into a fresh AxiomTensor
         return tuple(AxiomTensor(moved_data[i], new_axes) for i in range(dim_size))
-    
+
     @classmethod
     def concat(cls, tensors: List["AxiomTensor"], axis: Axis) -> "AxiomTensor":
         """Concatenates multiple AxiomTensors along the specified axis."""
@@ -583,9 +590,13 @@ class AxiomTensor:
             setattr(active_mod, param_name, nnx.Param(init_fn(rng, shape)))
 
         param = getattr(active_mod, param_name)
-        if hasattr(param, "get_value"):
-            return param.get_value()
-        return param.value
+
+        # Tracer-safe value retrieval
+        try:
+            return param[...]
+        except AttributeError:
+            # Fallback for raw JAX arrays or older Flax APIs
+            return param
 
     def _broadcast_vector(self, vector, idx: int, ndim: int):
         shape = [1] * ndim
@@ -1333,6 +1344,16 @@ class AxiomTensor:
     def _execute_ops(self, current_data, current_axis_names, token, idx):
         current_token = self._strip_runtime_token(token, fallback_size=int(current_data.shape[idx]))
 
+        # --- Handle Semantic Slices ---
+        for op in token.ops:
+            if isinstance(op, slice):
+                # Build an n-dimensional slice tuple targeting this specific axis
+                indexer = [slice(None)] * current_data.ndim
+                indexer[idx] = op
+                current_data = current_data[tuple(indexer)]
+                # Materialize the new shrunk size
+                current_token = self._materialize_token_size(current_token, current_data.shape[idx])
+
         for op in token.ops:
             if isinstance(op, (ConvModeOp, ConvStrideOp, ConvDilationOp)):
                 raise AxiomSyntaxError(
@@ -1986,7 +2007,6 @@ class AxiomTensor:
         if not isinstance(tokens, tuple):
             tokens = (tokens,)
 
-        # Type-safe arrow extraction to avoid triggering __eq__ on Axis objects
         arrow_indices = [i for i, t in enumerate(tokens) if isinstance(t, str) and t == "->"]
 
         if len(arrow_indices) > 1:
@@ -1998,75 +2018,153 @@ class AxiomTensor:
         else:
             lhs_tokens, rhs_tokens = tokens, None
 
+        # 1. Native Ellipsis Resolution on LHS
         lhs_resolved = self._resolve_ellipsis(lhs_tokens, self.axes)
 
-        # Intercept and dynamically resolve any SymbolicSize objects parsed from the LHS
-        size_map = {a.name: int(self.data.shape[i]) for i, a in enumerate(self.axes)}
+        # 2. Strict Rank Validation
+        if len(lhs_resolved) != len(self.axes):
+            raise AxiomShapeError(
+                f"LHS logical axes ({len(lhs_resolved)}) do not match physical tensor rank ({len(self.axes)}). "
+                f"Did you forget an Ellipsis (...)?"
+            )
+
+        # 3. Positional Alignment (Reorder data to match user's explicit LHS)
+        current_data = self.data
+        current_axis_names = [a.name for a in self.axes]
+
+        # Use source names to look up the physical dimensions natively
+        lhs_source_names = [getattr(t, "source_name", getattr(t, "name", str(t))) for t in lhs_resolved]
+        lhs_names = [getattr(t, "name", str(t)) for t in lhs_resolved]
+        self._assert_unique_names(lhs_names, "LHS layout")
+
+        try:
+            perm = [current_axis_names.index(n) for n in lhs_source_names]
+        except ValueError as e:
+            raise AxiomShapeError(f"LHS references unknown axes. Available: {current_axis_names}") from e
+
+        if perm != list(range(len(perm))):
+            current_data = jnp.transpose(current_data, perm)
+
+        # Lock in the new names (applying aliases) so operations find them
+        current_axis_names = lhs_names
+
+        # 4. Resolve Runtime Sizes
+        size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
         lhs_resolved = [self._resolve_token_sizes(t, size_map) for t in lhs_resolved]
 
-        if len(lhs_resolved) != len(self.axes):
-            raise AxiomShapeError("LHS logical axes do not match physical tensor rank.")
+        # 5. Execute LHS Mutations & Monadic Scopes
+        surviving_tokens = []
+        for token in lhs_resolved:
+            token_name = getattr(token, "name", str(token))
 
-        current_data = self.data
-        unpacked_shape = []
-        flat_lhs_tokens = []
+            # Dynamically find index because rank-changing ops (unfold) shift physical indices
+            idx = current_axis_names.index(token_name)
 
-        for i, (ax_def, token) in enumerate(zip(self.axes, lhs_resolved)):
-            # The Ultimate Guardrail: LHS must exactly match physical layout
-            token_name = getattr(token, "source_name", getattr(token, "name", str(token)))
-            if token_name != ax_def.name:
-                raise AxiomShapeError(
-                    f"LHS axis mismatch at index {i}: expected physical axis '{ax_def.name}', "
-                    f"but got '{token_name}'. The LHS must exactly describe the current physical layout. "
-                    f"Use '->' for routing or reordering."
+            if isinstance(token, AxisView):
+                # Phase 1: Extract Inner Scope (with Dynamic Boundary Resolution)
+                size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
+
+                def _resolve_bound(b):
+                    if b is None: return None
+
+                    # 1. If it's an Axis, evaluate its internal math first
+                    if hasattr(b, "size"):
+                        if hasattr(b.size, "resolve"):
+                            return int(b.size.resolve(size_map))
+                        if b.size is not None:
+                            return int(b.size)
+                        # Fallback for plain `ax.d` with no size attached
+                        return size_map.get(b.name, None)
+
+                    # 2. If it's a raw SymbolicSize
+                    if hasattr(b, "resolve"):
+                        return int(b.resolve(size_map))
+
+                    # 3. If it's just a regular integer
+                    return int(b)
+
+                resolved_slice = slice(
+                    _resolve_bound(token.slice_obj.start),
+                    _resolve_bound(token.slice_obj.stop),
+                    _resolve_bound(token.slice_obj.step)
                 )
 
-            if isinstance(token, PackedAxis):
-                token_name = getattr(token, "source_name", token.name)
-                if token_name != ax_def.name:
-                    raise AxiomShapeError(
-                        f"Expected packed axis '{ax_def.name}', got '{token_name}'. Use '->' to route."
-                    )
+                indexer = [slice(None)] * current_data.ndim
+                indexer[idx] = resolved_slice
+                sub_data = current_data[tuple(indexer)]
 
-                if token.ops:
-                    unpacked_shape.append(int(current_data.shape[i]))
-                    flat_lhs_tokens.append(token)
-                    continue
-
-                unknown_count = sum(1 for a in token.axes if a.size is None)
-                if unknown_count > 1:
-                    unpacked_shape.append(int(current_data.shape[i]))
-                    flat_lhs_tokens.append(token)
+                # Phase 2: Execute Inner Ops
+                if token.inner_ops:
+                    dummy_inner = Axis(token.name, int(sub_data.shape[idx]), token.inner_ops)
+                    sub_data, _, dummy_inner_res = self._execute_ops(sub_data, current_axis_names.copy(), dummy_inner,
+                                                                     idx)
                 else:
-                    for a in token.axes:
-                        unpacked_shape.append(a.size if a.size is not None else -1)
-                        flat_lhs_tokens.append(a)
-            else:
-                unpacked_shape.append(int(current_data.shape[i]))
-                flat_lhs_tokens.append(token)
+                    dummy_inner_res = Axis(token.name, int(sub_data.shape[idx]), source_name=token.source_name)
 
-        current_data = jnp.reshape(current_data, unpacked_shape)
-        current_axis_names = [t.name for t in flat_lhs_tokens]
-        self._assert_unique_names(current_axis_names, "LHS after unpack")
+                # Phase 3 & 4: Patching and Outer Ops
+                if token.is_closed:
+                    current_data = current_data.at[tuple(indexer)].set(sub_data)
 
-        surviving_tokens = []
-        for token in flat_lhs_tokens:
-            if isinstance(token, (Axis, PackedAxis)):
-                idx = current_axis_names.index(token.name)
+                    reductions = [op for op in token.outer_ops if isinstance(op, ConsumedSlot)]
+                    normal_outer = [op for op in token.outer_ops if not isinstance(op, ConsumedSlot)]
+
+                    if normal_outer:
+                        dummy_outer = Axis(token.name, int(current_data.shape[idx]), normal_outer)
+                        current_data, current_axis_names, final_token = self._execute_ops(current_data,
+                                                                                          current_axis_names,
+                                                                                          dummy_outer, idx)
+                    else:
+                        final_token = Axis(token.name, int(current_data.shape[idx]), source_name=token.source_name)
+
+                    if reductions:
+                        red = reductions[0]
+                        if red.op == "sum":
+                            current_data = jnp.sum(current_data, axis=idx)
+                        elif red.op == "mean":
+                            current_data = jnp.mean(current_data, axis=idx)
+                        elif red.op == "max":
+                            current_data = jnp.max(current_data, axis=idx)
+                        elif red.op == "min":
+                            current_data = jnp.min(current_data, axis=idx)
+                        elif red.op == "var":
+                            current_data = jnp.var(current_data, axis=idx)
+                        elif red.op == "std":
+                            current_data = jnp.std(current_data, axis=idx)
+                        elif red.op == "logsumexp":
+                            current_data = jsp.special.logsumexp(current_data, axis=idx)
+                        elif red.op == "argmax":
+                            current_data = jnp.argmax(current_data, axis=idx)
+                        elif red.op == "argmin":
+                            current_data = jnp.argmin(current_data, axis=idx)
+                        elif red.op == "any":
+                            current_data = jnp.any(current_data, axis=idx)
+                        elif red.op == "all":
+                            current_data = jnp.all(current_data, axis=idx)
+                        current_axis_names.pop(idx)
+                    else:
+                        if isinstance(final_token, tuple):
+                            surviving_tokens.extend(final_token)
+                        else:
+                            surviving_tokens.append(final_token)
+                else:
+                    # Scope is Open: User just wants the mutated slice. No patching!
+                    current_data = sub_data
+                    if isinstance(dummy_inner_res, tuple):
+                        surviving_tokens.extend(dummy_inner_res)
+                    else:
+                        surviving_tokens.append(dummy_inner_res)
+
+            elif isinstance(token, (Axis, PackedAxis)):
                 current_data, current_axis_names, current_token = self._execute_ops(
                     current_data, current_axis_names, token, idx
                 )
                 self._assert_unique_names(current_axis_names, f"after executing ops on '{token.name}'")
-
-                # If an op (like unfold) spawned multiple axes, extend the list!
                 if isinstance(current_token, tuple):
                     surviving_tokens.extend(current_token)
                 else:
                     surviving_tokens.append(current_token)
 
             elif isinstance(token, ConsumedSlot):
-                idx = current_axis_names.index(token.name)
-
                 if token.op == "sum":
                     current_data = jnp.sum(current_data, axis=idx)
                 elif token.op == "mean":
@@ -2079,8 +2177,6 @@ class AxiomTensor:
                     current_data = jnp.var(current_data, axis=idx)
                 elif token.op == "std":
                     current_data = jnp.std(current_data, axis=idx)
-
-                # --- Phase 2: Advanced Reductions ---
                 elif token.op == "logsumexp":
                     current_data = jsp.special.logsumexp(current_data, axis=idx)
                 elif token.op == "argmax":
@@ -2094,14 +2190,12 @@ class AxiomTensor:
                 else:
                     raise AxiomSyntaxError(f"Unknown reduction op '{token.op}'.")
                 current_axis_names.pop(idx)
-                self._assert_unique_names(current_axis_names, f"after reduction '{token.op}'")
             else:
                 raise AxiomSyntaxError(f"Unsupported token type on LHS: {type(token)}")
 
+        # 6. RHS Routing Execution
         if rhs_tokens is not None:
             rhs_resolved = self._resolve_ellipsis(rhs_tokens, tuple(surviving_tokens))
-
-            # Resolve RHS symbolic sizes using the state immediately before layout execution!
             size_map = {name: int(current_data.shape[i]) for i, name in enumerate(current_axis_names)}
             rhs_resolved = [self._resolve_token_sizes(t, size_map) for t in rhs_resolved]
 
@@ -2125,8 +2219,7 @@ class AxiomTensor:
                 perm = [lhs_names.index(name) for name in flat_rhs_names]
             except ValueError as e:
                 raise AxiomShapeError(
-                    f"RHS references axes {flat_rhs_names}, but available routed axes are {lhs_names}."
-                ) from e
+                    f"RHS references axes {flat_rhs_names}, but available routed axes are {lhs_names}.") from e
 
             current_data = jnp.transpose(current_data, axes=perm)
 
