@@ -210,6 +210,15 @@ class GateOp:
         return "GateOp()"
 
 
+class ScaleOp:
+    def __init__(self, value=None, init_fn=None):
+        self.value = value
+        self.init_fn = init_fn
+
+    def __repr__(self):
+        return "ScaleOp()"
+
+
 class NormOp:
     def __init__(
             self,
@@ -519,6 +528,9 @@ class PackedAxis:
 
     def gate(self, tensor=None, init_fn=None):
         return self._spawn(list(self.ops) + [GateOp(tensor=tensor, init_fn=init_fn)])
+
+    def scale(self, value=None, init_fn=None):
+        return self._spawn(list(self.ops) + [ScaleOp(value=value, init_fn=init_fn)])
 
     def norm_rms(self, eps=1e-5, scale=None, init_scale=None):
         return self._spawn(
@@ -900,6 +912,9 @@ class Axis:
             list(self.ops) + [GateOp(tensor=tensor, init_fn=init_fn)],
             self.source_name,
         )
+
+    def scale(self, value=None, init_fn=None):
+        return self._spawn(list(self.ops) + [ScaleOp(value=value, init_fn=init_fn)])
 
     def mask(self, kind: str, other_axis: str = "left", fill_value=None):
         return Axis(

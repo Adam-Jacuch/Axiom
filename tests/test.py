@@ -1613,5 +1613,36 @@ class AxiomRuntimeTests(unittest.TestCase):
         expected = jnp.array([[900.0, 1600.0]], dtype=jnp.float32)
         assert_allclose(y.data, expected)
 
+    def test_monadic_scale_explicit(self):
+        # Shape: (1, 4)
+        data = jnp.array([[1.0, 2.0, 3.0, 4.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # Monad action:
+        # 1. Open scope on the middle two elements: ax.d[1:3]
+        # 2. Mutate inner: .scale(value=10.0)
+        # 3. Close scope: [:]
+        y = x[..., ax.d[1:3].scale(value=10.0)[:]]
+
+        # Expected workflow:
+        # inner scale: [2.0, 3.0] * 10.0 = [20.0, 30.0]
+        # outer patch: [1.0, 20.0, 30.0, 4.0]
+        assert_axes(self, y, ["b", "d"], [1, 4])
+        expected = jnp.array([[1.0, 20.0, 30.0, 4.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
+    def test_full_axis_scale(self):
+        # Shape: (1, 3)
+        data = jnp.array([[5.0, 10.0, 15.0]], dtype=jnp.float32)
+        x = tensor(data, ax.b, ax.d)
+
+        # Standard action: scale the entire axis
+        y = x[..., ax.d.scale(value=-2.0)]
+
+        # Expected: Everything multiplied by -2.0
+        assert_axes(self, y, ["b", "d"], [1, 3])
+        expected = jnp.array([[-10.0, -20.0, -30.0]], dtype=jnp.float32)
+        assert_allclose(y.data, expected)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

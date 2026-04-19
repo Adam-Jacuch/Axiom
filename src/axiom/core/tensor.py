@@ -8,7 +8,7 @@ import jax.scipy as jsp
 from flax import nnx
 
 from .axis import (
-    Axis, BiasOp, CastOp, ConsumedSlot, ConvOp, DropoutOp, GateOp, MaskOp,
+    Axis, BiasOp, CastOp, ConsumedSlot, ConvOp, DropoutOp, GateOp, ScaleOp, MaskOp,
     NormOp, PackedAxis, ProjOp, ScanOp, SymbolicSize, WhereOp, PadOp, GatherOp,
     RollOp, FillOp, AttendOp,
     ClampOp, StopGradientOp, ScatterOp, AssocScanOp,
@@ -1630,6 +1630,18 @@ class AxiomTensor:
                     init_fn=op.init_fn,
                     param_prefix="_axiom_gate",
                 )
+
+            elif isinstance(op, ScaleOp):
+                if op.value is not None:
+                    # Explicit static scalar or pre-existing parameter
+                    scalar = jnp.asarray(op.value, dtype=current_data.dtype)
+                    current_data = current_data * scalar
+                else:
+                    # Implicit learnable 1-parameter global scalar
+                    init = op.init_fn if op.init_fn is not None else a_init.ones
+                    # Shape is () for a single global scalar
+                    scale_param = self._get_or_create_param("_axiom_global_scale", (), init)
+                    current_data = current_data * scale_param.astype(current_data.dtype)
 
             elif isinstance(op, BiasOp):
                 current_data = self._apply_add_bias(
